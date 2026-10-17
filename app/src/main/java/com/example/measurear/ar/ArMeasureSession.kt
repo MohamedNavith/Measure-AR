@@ -3,21 +3,30 @@ package com.example.measurear.ar
 import android.content.Context
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Camera
+import com.google.ar.core.Config
 import com.google.ar.core.Frame
+import com.google.ar.core.InstantPlacementPoint
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
+import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
+import java.nio.FloatBuffer
 import kotlin.math.abs
 import kotlin.math.sqrt
 
 data class FrameHitUpdate(
     val hitPoint: Point3D?,
     val isPlaneLocked: Boolean,
-    val trackingHint: TrackingQualityHint
+    val isEdgeSnapped: Boolean,
+    val trackingHint: TrackingQualityHint,
+    val detectedSurfaceExtent: Pair<Float, Float>? = null
 )
 
 class ArMeasureSession {
+
+    private var lastSmoothedPoint: Point3D? = null
+    private var lastEdgeSnapped: Boolean = false
 
     fun checkArCoreAvailability(context: Context): Boolean {
         return try {
@@ -28,12 +37,47 @@ class ArMeasureSession {
         }
     }
 
-    /**
-     * Evaluates an ARCore [Frame] at the center of the viewport.
-     * Supports standard plane/point hit-testing as well as vertical ray-plane intersection
-     * when measuring vertical height above a locked floor anchor.
-     */
+    fun configureSessionFeatures(session: Session, config: Config) {
+        config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+        config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+
+        // Enable Instant Placement for instant hit testing without waiting for full planes
+        config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
+
+        // Enable Depth API if supported for mm-accurate depth mapping
+        config.depthMode = if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
+            Config.DepthMode.AUTOMATIC
+        } else {
+            Config.DepthMode.DISABLED
+        }
+
+        config.focusMode = Config.FocusMode.AUTO
+    }
+
+    fun setTorchMode(session: Session, enabled: Boolean): Boolean {
+        return try {
+            val config = session.config
+            config.flashMode = if (enabled) Config.FlashMode.TORCH else Config.FlashMode.OFF
+            session.configure(config)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun setFocusLock(session: Session, locked: Boolean): Boolean {
+        return try {
+            val config = session.config
+            config.focusMode = if (locked) Config.FocusMode.FIXED else Config.FocusMode.AUTO
+            session.configure(config)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     fun processFrame(
+        session: Session,
         frame: Frame,
         viewportWidth: Int,
         viewportHeight: Int,
@@ -44,22 +88,25 @@ class ArMeasureSession {
         val trackingHint = resolveTrackingHint(camera)
 
         if (camera.trackingState != TrackingState.TRACKING || viewportWidth <= 0 || viewportHeight <= 0) {
+            lastSmoothedPoint = null
             return FrameHitUpdate(
                 hitPoint = null,
                 isPlaneLocked = false,
+                isEdgeSnapped = false,
                 trackingHint = trackingHint
             )
         }
 
-        // In Height Mode, once the floor point (Point A) is placed, project the camera's
-        // center look ray onto a vertical axis directly above/below Point A.
+        // In Height Mode, once Point A is placed, project center ray onto vertical axis
         if (measureMode == MeasureMode.HEIGHT && placedPoints.size == 1) {
             val floorPoint = placedPoints.first()
             val verticalPoint = computeVerticalHeightTarget(camera, floorPoint)
             if (verticalPoint != null) {
+                lastSmoothedPoint = verticalPoint
                 return FrameHitUpdate(
                     hitPoint = verticalPoint,
                     isPlaneLocked = true,
+                    isEdgeSnapped = false,
                     trackingHint = TrackingQualityHint.NONE
                 )
             }
@@ -69,7 +116,7 @@ class ArMeasureSession {
         val centerY = viewportHeight * 0.5f
         val hitResults = frame.hitTest(centerX, centerY)
 
-        // Prioritize tracked Planes within polygon bounds, then feature points
+        // 1. Plane polygon hit (highest confidence)
         val planeHit = hitResults.firstOrNull { hit ->
             val trackable = hit.trackable
             trackable is Plane &&
@@ -77,49 +124,129 @@ class ArMeasureSession {
                 trackable.isPoseInPolygon(hit.hitPose)
         }
 
+        // 2. Instant placement hit (instant responsive surface tracking)
+        val instantHit = hitResults.firstOrNull { hit ->
+            val trackable = hit.trackable
+            trackable is InstantPlacementPoint &&
+                trackable.trackingState == TrackingState.TRACKING
+        }
+
+        // 3. General plane hit within extent bounds
+        val generalPlaneHit = hitResults.firstOrNull { hit ->
+            val trackable = hit.trackable
+            trackable is Plane && trackable.trackingState == TrackingState.TRACKING
+        }
+
+        // 4. Feature point hit
         val featureHit = hitResults.firstOrNull { hit ->
             val trackable = hit.trackable
-            trackable is Point &&
-                trackable.trackingState == TrackingState.TRACKING &&
-                trackable.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL
+            trackable is Point && trackable.trackingState == TrackingState.TRACKING
         }
 
-        val chosenHit = planeHit ?: featureHit
-        return if (chosenHit != null) {
-            val pose = chosenHit.hitPose
-            FrameHitUpdate(
-                hitPoint = Point3D(pose.tx(), pose.ty(), pose.tz()),
-                isPlaneLocked = planeHit != null,
-                trackingHint = TrackingQualityHint.NONE
-            )
-        } else {
-            FrameHitUpdate(
+        val chosenHit = planeHit ?: instantHit ?: generalPlaneHit ?: featureHit
+
+        if (chosenHit == null) {
+            lastSmoothedPoint = null
+            return FrameHitUpdate(
                 hitPoint = null,
                 isPlaneLocked = false,
-                trackingHint = if (trackingHint == TrackingQualityHint.NONE) {
-                    TrackingQualityHint.INITIALIZING
-                } else {
-                    trackingHint
-                }
+                isEdgeSnapped = false,
+                trackingHint = if (trackingHint == TrackingQualityHint.NONE) TrackingQualityHint.INITIALIZING else trackingHint
             )
         }
+
+        val hitPose = chosenHit.hitPose
+        val rawPoint = Point3D(hitPose.tx(), hitPose.ty(), hitPose.tz())
+
+        // Extract plane extent for auto surface dimension detection
+        var surfaceExtent: Pair<Float, Float>? = null
+        val targetPlane = (chosenHit.trackable as? Plane)
+        if (targetPlane != null && targetPlane.trackingState == TrackingState.TRACKING) {
+            surfaceExtent = targetPlane.extentX to targetPlane.extentZ
+        }
+
+        // Edge Detection & Magnetic Snapping
+        val edgeSegments = extractPlaneEdgeSegments(session)
+        val (edgeSnappedPoint, didEdgeSnap) = DistanceCalculator.snapToNearestEdge(
+            point = rawPoint,
+            edgeSegments = edgeSegments,
+            thresholdMeters = 0.045f
+        )
+
+        // Axis / Level Alignment Snapping (when extending from last point)
+        val candidatePoint = if (didEdgeSnap) {
+            edgeSnappedPoint
+        } else if (placedPoints.isNotEmpty()) {
+            val (axisSnapped, didAxisSnap) = DistanceCalculator.snapToLevelAxis(
+                start = placedPoints.last(),
+                current = rawPoint,
+                thresholdDegrees = 3.5f
+            )
+            if (didAxisSnap) axisSnapped else rawPoint
+        } else {
+            rawPoint
+        }
+
+        // Low-pass EMA filter to eliminate distance drift and lens breathing
+        val finalPoint = if (didEdgeSnap || lastSmoothedPoint == null) {
+            candidatePoint
+        } else {
+            val prev = lastSmoothedPoint!!
+            val moveDelta = DistanceCalculator.calculateEuclideanDistance(prev, candidatePoint)
+            // If moved significantly, track fast; if stationary, smooth aggressively
+            val alpha = if (moveDelta > 0.06f) 0.85f else 0.32f
+            Point3D(
+                x = prev.x * (1f - alpha) + candidatePoint.x * alpha,
+                y = prev.y * (1f - alpha) + candidatePoint.y * alpha,
+                z = prev.z * (1f - alpha) + candidatePoint.z * alpha
+            )
+        }
+
+        lastSmoothedPoint = finalPoint
+        lastEdgeSnapped = didEdgeSnap
+
+        return FrameHitUpdate(
+            hitPoint = finalPoint,
+            isPlaneLocked = planeHit != null || generalPlaneHit != null,
+            isEdgeSnapped = didEdgeSnap,
+            trackingHint = TrackingQualityHint.NONE,
+            detectedSurfaceExtent = surfaceExtent
+        )
     }
 
-    /**
-     * Intersects the camera's forward look ray with a vertical plane containing [floorPoint]
-     * and facing the camera, locking X and Z to [floorPoint] so the line rises straight up.
-     */
+    private fun extractPlaneEdgeSegments(session: Session): List<Pair<Point3D, Point3D>> {
+        val segments = mutableListOf<Pair<Point3D, Point3D>>()
+        val planes = session.getAllTrackables(Plane::class.java)
+        for (plane in planes) {
+            if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) continue
+            val polygon: FloatBuffer = plane.polygon ?: continue
+            val vertices = mutableListOf<Point3D>()
+            polygon.rewind()
+            while (polygon.hasRemaining()) {
+                val x = polygon.get()
+                val z = polygon.get()
+                val world = plane.centerPose.transformPoint(floatArrayOf(x, 0f, z))
+                vertices.add(Point3D(world[0], world[1], world[2]))
+            }
+            if (vertices.size >= 2) {
+                for (i in 0 until vertices.size) {
+                    val next = vertices[(i + 1) % vertices.size]
+                    segments.add(vertices[i] to next)
+                }
+            }
+        }
+        return segments
+    }
+
     private fun computeVerticalHeightTarget(camera: Camera, floorPoint: Point3D): Point3D? {
         val camPose = camera.displayOrientedPose
         val camPos = Point3D(camPose.tx(), camPose.ty(), camPose.tz())
 
-        // Camera forward vector is -Z axis in OpenGL/ARCore camera space
         val zAxis = camPose.zAxis
         val rayDirX = -zAxis[0]
         val rayDirY = -zAxis[1]
         val rayDirZ = -zAxis[2]
 
-        // Normal in horizontal XZ plane from floorPoint toward camera
         val toCamX = camPos.x - floorPoint.x
         val toCamZ = camPos.z - floorPoint.z
         val horizDist = sqrt(toCamX * toCamX + toCamZ * toCamZ)

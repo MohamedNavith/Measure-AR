@@ -57,4 +57,14 @@ object UnitConverter {
             MeasureUnit.FT -> String.format(Locale.US, "%.2f ft²", safeSqMeters * 10.76391f)
         }
     }
+
+    fun formatVolume(cubicMeters: Float, unit: MeasureUnit): String {
+        val safeCubicMeters = cubicMeters.coerceAtLeast(0f)
+        return when (unit) {
+            MeasureUnit.CM -> String.format(Locale.US, "%.0f cm³", safeCubicMeters * 1_000_000f)
+            MeasureUnit.M -> String.format(Locale.US, "%.3f m³", safeCubicMeters)
+            MeasureUnit.IN -> String.format(Locale.US, "%.0f in³", safeCubicMeters * 61023.74f)
+            MeasureUnit.FT -> String.format(Locale.US, "%.2f ft³", safeCubicMeters * 35.31467f)
+        }
+    }
 }

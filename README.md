@@ -70,21 +70,25 @@ adb install -r app-release.apk
 
 ---
 
-## ✨ Features
+## ✨ Advanced iOS-Parity Features
 
 - **Instant AR Camera View**: Launches straight into full-screen AR after smooth camera-permission and ARCore-availability checks.
 - **Subtle Surface Dot Grid**: Detects horizontal and vertical surfaces and projects an iOS-style discrete dot mesh over tracked planes.
-- **Animated Center Reticle**: Real-time crosshair that dynamically springs from white to green when locked onto a tracked plane.
-- **Procedural 3D Geometry**:
-  - Anchors 3D sphere markers at exact real-world coordinates.
-  - Renders 3D cylinders connecting points in real time using SceneView and Google Filament.
-- **Floating Distance Badges**: Projects 3D segment midpoints to 2D screen coordinates with zero lag, displaying pill-shaped distance badges with tabular-nums typography.
-- **Three Measuring Modes**:
+- **Instant Placement & Depth API**: Integrates ARCore Depth API and `InstantPlacementMode.LOCAL_Y_UP` for instant surface tracking even on low-texture or untextured surfaces.
+- **Magnetic Edge Snapping**: Snaps the 3D reticle to the nearest polygon boundary or table/wall edge within 3.5cm, accompanied by a subtle tactile haptic tick.
+- **Flashlight / Torch Toggle**: One-tap top button toggling the camera LED flash (`Config.FlashMode.TORCH`) to illuminate dim rooms and dramatically boost feature detection.
+- **Focus Lock (Distance Stabilization)**: Toggles camera autofocus between `Config.FocusMode.AUTO` and `Config.FocusMode.FIXED`. Locking focus prevents camera breathing and eliminates distance fluctuation or jumping during measurement.
+- **Real-Time Gyro Level Tool**: Real-time IMU rotation vector / accelerometer sensor listener showing current tilt angle (e.g. `0° LEVEL` in bright green) for surface and framing leveling.
+- **Dynamic EMA Low-Pass Filter**: Exponential moving average filter with dynamic velocity scaling ($\alpha=0.32$ stationary, $\alpha=0.85$ fast motion) removing sensor noise and hand jitter.
+- **Five Measuring Modes**:
   1. **Standard Distance**: Measures 3D Euclidean distance between Point A and Point B.
-  2. **Chain / Area Mode**: Multi-point polyline chaining for perimeter; automatically computes enclosed 3D polygon area for 4+ points using Newell's method.
-  3. **Height Mode**: Anchors a base point on the floor and projects a vertical ray locked in the X/Z plane to measure true vertical heights.
+  2. **3D Box / Volume**: Simultaneously calculates and renders 12 procedural wireframe edges for Length, Breadth, Height, Volume ($m^3 / cm^3 / ft^3$), and Surface Area.
+  3. **2D Surface / Rectangle**: Frames rectangular planes with 4 procedural wireframe edges, displaying Length, Breadth, Area ($m^2 / cm^2 / ft^2$), and Perimeter simultaneously.
+  4. **Height Mode**: Anchors a base point on the floor and projects a vertical ray locked in the X/Z plane to measure true vertical heights.
+  5. **Chain / Area Mode**: Multi-point polyline chaining for perimeter; automatically computes enclosed 3D polygon area for 4+ points using Newell's method.
+- **Floating Distance Badges**: Projects 3D segment midpoints to 2D screen coordinates with zero lag, displaying pill-shaped distance badges with tabular-nums typography.
 - **Persistent Unit Toggle**: Quick-cycle and toggle between `cm`, `m`, `in`, and `ft & in` on the fly, persisted in Jetpack DataStore.
-- **Tracking Quality Hints**: Contextual instruction pills for environmental conditions: *"Move phone slowly"*, *"Find a textured surface"*, *"Too dark"*, etc.
+- **Tracking Quality Hints**: Contextual instruction pills for environmental conditions: *"Move phone slowly"*, *"Find a textured surface"*, *"Too dark — turn on flash with top button"*, etc.
 - **Undo & Clear**: Undo points step-by-step or clear all placed anchors and segments with one tap.
 - **PixelCopy AR Frame Sharing**: Captures the live OpenGL surface, burns in measurement lines, markers, and distance badges, and launches the native Android share sheet.
 - **Measurement History**: Room database persistence with timestamps, thumbnail previews, swipe-to-delete, and multi-unit breakdown dialog.
@@ -97,14 +101,23 @@ adb install -r app-release.apk
 ### 3D Euclidean Distance
 $$d = \sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2 + (z_2 - z_1)^2}$$
 
+### 3D Box Dimensions & Volume
+$$\text{Length} = \max(\Delta x, \Delta y, \Delta z), \quad \text{Breadth} = \text{median}(\Delta x, \Delta y, \Delta z), \quad \text{Height} = \min(\Delta x, \Delta y, \Delta z)$$
+$$\text{Volume} = \text{Length} \times \text{Breadth} \times \text{Height}$$
+$$\text{Surface Area} = 2 \times (\text{Length} \cdot \text{Breadth} + \text{Length} \cdot \text{Height} + \text{Breadth} \cdot \text{Height})$$
+
 ### 3D Polygon Area (Newell's Method / Triangle Fan)
 $$\text{Area} = \frac{1}{2} \sum_{i=1}^{n-2} \| (\vec{P}_i - \vec{P}_0) \times (\vec{P}_{i+1} - \vec{P}_0) \|$$
+
+### Edge Snapping Projection
+For a raycast point $\vec{P}$ and edge segment $\vec{A} \to \vec{B}$:
+$$t = \text{clamp}\left(\frac{(\vec{P} - \vec{A}) \cdot (\vec{B} - \vec{A})}{\|\vec{B} - \vec{A}\|^2}, 0, 1\right), \quad \vec{P}_{\text{snapped}} = \vec{A} + t(\vec{B} - \vec{A})$$
 
 ### Pure State Machine
 The `MeasureViewModel` is completely decoupled from Android or ARCore framework types:
 ```
 [Searching] 
-     │  (Plane detected)
+     │  (Plane detected / Instant placement)
      ▼
 [ReadyToPlaceA] 
      │  (Tap shutter +)
@@ -113,7 +126,7 @@ The `MeasureViewModel` is completely decoupled from Android or ARCore framework 
      │  (Move reticle > 5mm)
      ▼
 [Live] ───────────┐
-     │            │ (Tap shutter + to commit Point B)
+     │            │ (Tap shutter + to commit Point B / Diagonal Corner)
      │            ▼
      └───────> [Done] (Lock measurement -> Save / Share / Undo / New)
 ```
@@ -152,22 +165,23 @@ MeasureAR/
 │       │       ├── MeasureArApplication.kt
 │       │       ├── MainActivity.kt # Edge-to-edge Compose navigation
 │       │       ├── ar/
-│       │       │   ├── DistanceCalculator.kt # Pure math (Euclidean, Height, Area, Polyline)
-│       │       │   ├── ArMeasureSession.kt   # ARCore frame processing & raycasting
-│       │       │   └── ArLineRenderer.kt     # SceneView 3D nodes & 2D frustum projection
+│       │       │   ├── DistanceCalculator.kt    # Pure math (Euclidean, Height, Area, Box, Snap)
+│       │       │   ├── ArMeasureSession.kt      # ARCore frame processing, depth, torch, focus
+│       │       │   ├── ArLineRenderer.kt        # SceneView 3D box/line nodes & 2D projection
+│       │       │   └── GyroOrientationSensor.kt # IMU rotation vector & leveling sensor
 │       │       ├── data/
-│       │       │   ├── MeasurementEntity.kt   # Room database entity
-│       │       │   ├── MeasurementDao.kt      # Room DAO
-│       │       │   ├── AppDatabase.kt         # Room database definition
+│       │       │   ├── MeasurementEntity.kt     # Room database entity
+│       │       │   ├── MeasurementDao.kt        # Room DAO
+│       │       │   ├── AppDatabase.kt           # Room database definition
 │       │       │   ├── MeasurementRepository.kt
-│       │       │   └── SettingsRepository.kt  # Jetpack DataStore preferences
+│       │       │   └── SettingsRepository.kt    # Jetpack DataStore preferences
 │       │       ├── di/
-│       │       │   └── AppModule.kt           # Hilt dependency injection module
+│       │       │   └── AppModule.kt             # Hilt dependency injection module
 │       │       ├── util/
-│       │       │   ├── UnitConverter.kt       # Unit conversions & formatters
-│       │       │   └── BitmapShareHelper.kt   # PixelCopy capture & overlay burning
+│       │       │   ├── UnitConverter.kt         # Unit conversions & formatters (inc. Volume)
+│       │       │   └── BitmapShareHelper.kt     # PixelCopy capture & overlay burning
 │       │       └── ui/
-│       │           ├── theme/Theme.kt         # Compose Material 3 dark/light theme
+│       │           ├── theme/Theme.kt           # Compose Material 3 dark/light theme
 │       │           ├── components/GlassmorphicComponents.kt # Reticle, Shutter, Cards
 │       │           ├── camera/
 │       │           │   ├── MeasureViewModel.kt      # Pure StateFlow state machine

@@ -31,4 +31,11 @@ class UnitConverterTest {
         assertEquals("2.50 m²", UnitConverter.formatArea(2.5f, MeasureUnit.M))
         assertEquals("25000 cm²", UnitConverter.formatArea(2.5f, MeasureUnit.CM))
     }
+
+    @Test
+    fun `formatVolume converts cubic meters to target volume units`() {
+        assertEquals("0.500 m³", UnitConverter.formatVolume(0.5f, MeasureUnit.M))
+        assertEquals("500000 cm³", UnitConverter.formatVolume(0.5f, MeasureUnit.CM))
+        assertEquals("17.66 ft³", UnitConverter.formatVolume(0.5f, MeasureUnit.FT))
+    }
 }

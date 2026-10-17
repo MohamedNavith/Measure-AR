@@ -2,9 +2,11 @@ package com.example.measurear.ui.camera
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.measurear.ar.BoxDimensions
 import com.example.measurear.ar.DistanceCalculator
 import com.example.measurear.ar.MeasureMode
 import com.example.measurear.ar.Point3D
+import com.example.measurear.ar.RectangleDimensions
 import com.example.measurear.ar.TrackingQualityHint
 import com.example.measurear.data.MeasurementEntity
 import com.example.measurear.data.MeasurementRepository
@@ -43,10 +45,15 @@ data class MeasureUiState(
     val placedPoints: List<Point3D> = emptyList(),
     val reticlePoint: Point3D? = null,
     val isReticleLocked: Boolean = false,
+    val isEdgeSnapped: Boolean = false,
+    val isTorchEnabled: Boolean = false,
+    val isFocusLocked: Boolean = false,
     val trackingHint: TrackingQualityHint = TrackingQualityHint.INITIALIZING,
     val liveSegmentMeters: Float = 0f,
     val committedTotalMeters: Float = 0f,
     val polygonAreaSqMeters: Float? = null,
+    val boxDimensions: BoxDimensions? = null,
+    val rectangleDimensions: RectangleDimensions? = null,
     val isSavedToHistory: Boolean = false
 ) {
     val activeDisplayMeters: Float
@@ -93,14 +100,22 @@ data class MeasureUiState(
                     MeasureMode.STANDARD -> "Tap + to place start point"
                     MeasureMode.MULTI_POINT -> "Tap + to start perimeter chain"
                     MeasureMode.HEIGHT -> "Aim at floor and tap + to set base"
+                    MeasureMode.BOX_3D -> "Tap + at 1st box corner"
+                    MeasureMode.RECTANGLE -> "Tap + at 1st surface corner"
                 }
                 MeasureStepState.PlacedA -> "Move slightly to start measuring"
                 MeasureStepState.Live -> when (mode) {
                     MeasureMode.STANDARD -> "Move to target and tap + to finish"
                     MeasureMode.MULTI_POINT -> "Tap + to add point, or checkmark to finish"
                     MeasureMode.HEIGHT -> "Tilt phone up to top edge and tap +"
+                    MeasureMode.BOX_3D -> "Move to opposite diagonal corner and tap +"
+                    MeasureMode.RECTANGLE -> "Move diagonally across surface and tap +"
                 }
-                MeasureStepState.Done -> "Measurement locked"
+                MeasureStepState.Done -> when (mode) {
+                    MeasureMode.BOX_3D -> "3D Box dimensions locked"
+                    MeasureMode.RECTANGLE -> "Surface dimensions locked"
+                    else -> "Measurement locked"
+                }
             }
         }
 }
@@ -130,6 +145,7 @@ class MeasureViewModel @Inject constructor(
     fun onFrameHitUpdated(
         hitPoint: Point3D?,
         isPlaneLocked: Boolean,
+        isEdgeSnapped: Boolean,
         trackingHint: TrackingQualityHint
     ) {
         _uiState.update { current ->
@@ -137,6 +153,7 @@ class MeasureViewModel @Inject constructor(
                 return@update current.copy(
                     reticlePoint = hitPoint,
                     isReticleLocked = isPlaneLocked,
+                    isEdgeSnapped = isEdgeSnapped,
                     trackingHint = trackingHint
                 )
             }
@@ -168,12 +185,23 @@ class MeasureViewModel @Inject constructor(
                 0f
             }
 
+            val liveBox = if (current.mode == MeasureMode.BOX_3D && current.placedPoints.isNotEmpty() && hitPoint != null) {
+                DistanceCalculator.calculateBoundingBox(current.placedPoints.first(), hitPoint)
+            } else null
+
+            val liveRect = if (current.mode == MeasureMode.RECTANGLE && current.placedPoints.isNotEmpty() && hitPoint != null) {
+                DistanceCalculator.calculateRectangleDimensions(current.placedPoints.first(), hitPoint)
+            } else null
+
             current.copy(
                 stepState = nextStep,
                 reticlePoint = hitPoint,
                 isReticleLocked = isPlaneLocked,
+                isEdgeSnapped = isEdgeSnapped,
                 trackingHint = trackingHint,
-                liveSegmentMeters = liveDistance
+                liveSegmentMeters = liveDistance,
+                boxDimensions = liveBox ?: current.boxDimensions,
+                rectangleDimensions = liveRect ?: current.rectangleDimensions
             )
         }
     }
@@ -221,9 +249,19 @@ class MeasureViewModel @Inject constructor(
                 liveSegmentMeters = 0f,
                 committedTotalMeters = 0f,
                 polygonAreaSqMeters = null,
+                boxDimensions = null,
+                rectangleDimensions = null,
                 isSavedToHistory = false
             )
         }
+    }
+
+    fun setTorchEnabled(enabled: Boolean) {
+        _uiState.update { it.copy(isTorchEnabled = enabled) }
+    }
+
+    fun setFocusLocked(locked: Boolean) {
+        _uiState.update { it.copy(isFocusLocked = locked) }
     }
 
     fun setMeasureMode(mode: MeasureMode) {
@@ -263,10 +301,33 @@ class MeasureViewModel @Inject constructor(
 
         val unit = settings.value.unit
         val formattedPrimary = UnitConverter.formatDistance(state.committedTotalMeters, unit)
-        val formattedFull = if (state.polygonAreaSqMeters != null && state.polygonAreaSqMeters > 0f) {
-            "$formattedPrimary • Area: ${UnitConverter.formatArea(state.polygonAreaSqMeters, unit)}"
-        } else {
-            formattedPrimary
+        val formattedFull = when (state.mode) {
+            MeasureMode.BOX_3D -> {
+                val b = state.boxDimensions
+                if (b != null) {
+                    val lStr = UnitConverter.formatDistance(b.length, unit)
+                    val wStr = UnitConverter.formatDistance(b.breadth, unit)
+                    val hStr = UnitConverter.formatDistance(b.height, unit)
+                    val vStr = UnitConverter.formatVolume(b.volume, unit)
+                    "$lStr × $wStr × $hStr ($vStr)"
+                } else formattedPrimary
+            }
+            MeasureMode.RECTANGLE -> {
+                val r = state.rectangleDimensions
+                if (r != null) {
+                    val lStr = UnitConverter.formatDistance(r.length, unit)
+                    val wStr = UnitConverter.formatDistance(r.breadth, unit)
+                    val aStr = UnitConverter.formatArea(r.area, unit)
+                    "$lStr × $wStr ($aStr)"
+                } else formattedPrimary
+            }
+            else -> {
+                if (state.polygonAreaSqMeters != null && state.polygonAreaSqMeters > 0f) {
+                    "$formattedPrimary • Area: ${UnitConverter.formatArea(state.polygonAreaSqMeters, unit)}"
+                } else {
+                    formattedPrimary
+                }
+            }
         }
 
         val segmentLabels = state.segments
@@ -284,7 +345,7 @@ class MeasureViewModel @Inject constructor(
                     primaryMeters = state.committedTotalMeters,
                     areaSquareMeters = state.polygonAreaSqMeters,
                     formattedValue = formattedFull,
-                    pointsSummary = segmentLabels.ifEmpty { formattedPrimary },
+                    pointsSummary = segmentLabels.ifEmpty { formattedFull },
                     pointCount = state.placedPoints.size,
                     thumbnailPath = thumbnailPath
                 )
@@ -310,9 +371,12 @@ class MeasureViewModel @Inject constructor(
         }
 
         val reachedTargetCount = when (mode) {
-            MeasureMode.STANDARD, MeasureMode.HEIGHT -> points.size >= 2
+            MeasureMode.STANDARD, MeasureMode.HEIGHT, MeasureMode.BOX_3D, MeasureMode.RECTANGLE -> points.size >= 2
             MeasureMode.MULTI_POINT -> forceFinish && points.size >= 2
         }
+
+        var boxDims: BoxDimensions? = null
+        var rectDims: RectangleDimensions? = null
 
         val totalMeters = when (mode) {
             MeasureMode.HEIGHT -> {
@@ -327,12 +391,25 @@ class MeasureViewModel @Inject constructor(
                 val closeLoop = reachedTargetCount && points.size >= 4
                 DistanceCalculator.calculatePolylineLength(points, closeLoop = closeLoop)
             }
+            MeasureMode.BOX_3D -> {
+                if (points.size >= 2) {
+                    boxDims = DistanceCalculator.calculateBoundingBox(points[0], points[1])
+                    boxDims.length
+                } else 0f
+            }
+            MeasureMode.RECTANGLE -> {
+                if (points.size >= 2) {
+                    rectDims = DistanceCalculator.calculateRectangleDimensions(points[0], points[1])
+                    rectDims.perimeter
+                } else 0f
+            }
         }
 
-        val areaSqMeters = if (mode == MeasureMode.MULTI_POINT && points.size >= 4) {
-            DistanceCalculator.calculatePolygonArea(points)
-        } else {
-            null
+        val areaSqMeters = when (mode) {
+            MeasureMode.MULTI_POINT -> if (points.size >= 4) DistanceCalculator.calculatePolygonArea(points) else null
+            MeasureMode.RECTANGLE -> rectDims?.area
+            MeasureMode.BOX_3D -> boxDims?.volume
+            else -> null
         }
 
         val nextStep = when {
@@ -348,6 +425,8 @@ class MeasureViewModel @Inject constructor(
                 committedTotalMeters = totalMeters,
                 liveSegmentMeters = 0f,
                 polygonAreaSqMeters = areaSqMeters,
+                boxDimensions = boxDims ?: current.boxDimensions,
+                rectangleDimensions = rectDims ?: current.rectangleDimensions,
                 isSavedToHistory = false
             )
         }

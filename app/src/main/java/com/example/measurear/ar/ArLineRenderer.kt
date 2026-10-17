@@ -32,6 +32,7 @@ class ArLineRenderer(
 ) {
     private val anchorNodes = mutableListOf<AnchorNode>()
     private val segmentNodes = mutableListOf<CylinderNode>()
+    private val boxEdges = mutableListOf<CylinderNode>()
     private var previewLineNode: CylinderNode? = null
     private var reticleSphereNode: SphereNode? = null
 
@@ -194,7 +195,103 @@ class ArLineRenderer(
             rootNodeRemover(lastSegment)
             lastSegment.destroy()
         }
+        clearBoxWireframe()
         updateLivePreviewLine(null, null)
+    }
+
+    fun updateBoxWireframe(cornerA: Point3D?, cornerB: Point3D?, isPreview: Boolean = true) {
+        if (cornerA == null || cornerB == null) {
+            clearBoxWireframe()
+            return
+        }
+        val minX = minOf(cornerA.x, cornerB.x)
+        val maxX = maxOf(cornerA.x, cornerB.x)
+        val minY = minOf(cornerA.y, cornerB.y)
+        val maxY = maxOf(cornerA.y, cornerB.y)
+        val minZ = minOf(cornerA.z, cornerB.z)
+        val maxZ = maxOf(cornerA.z, cornerB.z)
+
+        val v000 = Point3D(minX, minY, minZ)
+        val v001 = Point3D(minX, minY, maxZ)
+        val v010 = Point3D(minX, maxY, minZ)
+        val v011 = Point3D(minX, maxY, maxZ)
+        val v100 = Point3D(maxX, minY, minZ)
+        val v101 = Point3D(maxX, minY, maxZ)
+        val v110 = Point3D(maxX, maxY, minZ)
+        val v111 = Point3D(maxX, maxY, maxZ)
+
+        val edgePairs = listOf(
+            // Bottom 4 edges
+            v000 to v100, v100 to v101, v101 to v001, v001 to v000,
+            // Top 4 edges
+            v010 to v110, v110 to v111, v111 to v011, v011 to v010,
+            // 4 Vertical upright edges
+            v000 to v010, v100 to v110, v101 to v111, v001 to v011
+        )
+
+        while (boxEdges.size < edgePairs.size) {
+            val cyl = CylinderNode(
+                engine = materialLoader.engine,
+                radius = 0.0028f,
+                height = 1.0f,
+                materialInstance = if (isPreview) previewMaterial else lineMaterial
+            ).also { rootNodeConsumer(it) }
+            boxEdges.add(cyl)
+        }
+        for (i in edgePairs.indices) {
+            val (st, en) = edgePairs[i]
+            val cyl = boxEdges[i]
+            createOrUpdateCylinder(cyl, st, en, isPreview = isPreview)
+        }
+    }
+
+    fun updateRectangleWireframe(cornerA: Point3D?, cornerB: Point3D?, isPreview: Boolean = true) {
+        if (cornerA == null || cornerB == null) {
+            clearBoxWireframe()
+            return
+        }
+        val minX = minOf(cornerA.x, cornerB.x)
+        val maxX = maxOf(cornerA.x, cornerB.x)
+        val y = cornerA.y
+        val minZ = minOf(cornerA.z, cornerB.z)
+        val maxZ = maxOf(cornerA.z, cornerB.z)
+
+        val v00 = Point3D(minX, y, minZ)
+        val v10 = Point3D(maxX, y, minZ)
+        val v11 = Point3D(maxX, y, maxZ)
+        val v01 = Point3D(minX, y, maxZ)
+
+        val edgePairs = listOf(
+            v00 to v10, v10 to v11, v11 to v01, v01 to v00
+        )
+
+        while (boxEdges.size < edgePairs.size) {
+            val cyl = CylinderNode(
+                engine = materialLoader.engine,
+                radius = 0.0028f,
+                height = 1.0f,
+                materialInstance = if (isPreview) previewMaterial else lineMaterial
+            ).also { rootNodeConsumer(it) }
+            boxEdges.add(cyl)
+        }
+        for (i in edgePairs.indices) {
+            val (st, en) = edgePairs[i]
+            val cyl = boxEdges[i]
+            createOrUpdateCylinder(cyl, st, en, isPreview = isPreview)
+        }
+        while (boxEdges.size > edgePairs.size) {
+            val extra = boxEdges.removeAt(boxEdges.lastIndex)
+            rootNodeRemover(extra)
+            extra.destroy()
+        }
+    }
+
+    fun clearBoxWireframe() {
+        boxEdges.forEach {
+            rootNodeRemover(it)
+            it.destroy()
+        }
+        boxEdges.clear()
     }
 
     fun clearAll() {
@@ -210,6 +307,8 @@ class ArLineRenderer(
             node.destroy()
         }
         segmentNodes.clear()
+
+        clearBoxWireframe()
 
         previewLineNode?.let {
             rootNodeRemover(it)

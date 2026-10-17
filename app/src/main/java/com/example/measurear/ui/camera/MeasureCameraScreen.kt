@@ -17,6 +17,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,6 +33,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -40,7 +42,11 @@ import androidx.compose.material.icons.rounded.BookmarkAdd
 import androidx.compose.material.icons.rounded.CameraAlt
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.FlashlightOff
+import androidx.compose.material.icons.rounded.FlashlightOn
 import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.Lock
+import androidx.compose.material.icons.rounded.LockOpen
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Straighten
@@ -86,6 +92,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.measurear.ar.ArLineRenderer
 import com.example.measurear.ar.ArMeasureSession
+import com.example.measurear.ar.DeviceLevelData
+import com.example.measurear.ar.GyroOrientationSensor
 import com.example.measurear.ar.MeasureMode
 import com.example.measurear.ar.OverlaySegment2D
 import com.example.measurear.ar.Point3D
@@ -187,6 +195,17 @@ fun MeasureCameraScreen(
     var viewportSize by remember { mutableStateOf(IntSize.Zero) }
     var projectedSegments by remember { mutableStateOf<List<OverlaySegment2D>>(emptyList()) }
     var detectedSurfaceDots by remember { mutableStateOf<List<Pair<Float, Float>>>(emptyList()) }
+    var wasEdgeSnapped by remember { mutableStateOf(false) }
+
+    val gyroSensor = remember { GyroOrientationSensor(context) }
+    val levelData by gyroSensor.levelState.collectAsStateWithLifecycle()
+
+    DisposableEffect(gyroSensor) {
+        gyroSensor.startListening()
+        onDispose {
+            gyroSensor.stopListening()
+        }
+    }
 
     val lineRenderer = remember(materialLoader) {
         ArLineRenderer(
@@ -233,15 +252,23 @@ fun MeasureCameraScreen(
             onSessionUpdated = { session, frame ->
                 activeSession = session
                 val hitUpdate = arMeasureSession.processFrame(
+                    session = session,
                     frame = frame,
                     viewportWidth = viewportSize.width,
                     viewportHeight = viewportSize.height,
                     measureMode = uiState.mode,
                     placedPoints = uiState.placedPoints
                 )
+
+                if (hitUpdate.isEdgeSnapped && !wasEdgeSnapped && settings.hapticFeedbackEnabled) {
+                    localView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                }
+                wasEdgeSnapped = hitUpdate.isEdgeSnapped
+
                 viewModel.onFrameHitUpdated(
                     hitPoint = hitUpdate.hitPoint,
                     isPlaneLocked = hitUpdate.isPlaneLocked,
+                    isEdgeSnapped = hitUpdate.isEdgeSnapped,
                     trackingHint = hitUpdate.trackingHint
                 )
 
@@ -250,13 +277,56 @@ fun MeasureCameraScreen(
                     reticlePoint = hitUpdate.hitPoint,
                     isLocked = hitUpdate.isPlaneLocked
                 )
-                if (uiState.stepState == MeasureStepState.Live && uiState.placedPoints.isNotEmpty()) {
-                    lineRenderer.updateLivePreviewLine(
-                        start = uiState.placedPoints.last(),
-                        end = hitUpdate.hitPoint
-                    )
-                } else {
-                    lineRenderer.updateLivePreviewLine(null, null)
+
+                // Update procedural 3D wireframe according to mode
+                when (uiState.mode) {
+                    MeasureMode.BOX_3D -> {
+                        lineRenderer.updateLivePreviewLine(null, null)
+                        if (uiState.stepState == MeasureStepState.Live && uiState.placedPoints.isNotEmpty()) {
+                            lineRenderer.updateBoxWireframe(
+                                cornerA = uiState.placedPoints.first(),
+                                cornerB = hitUpdate.hitPoint,
+                                isPreview = true
+                            )
+                        } else if (uiState.stepState == MeasureStepState.Done && uiState.placedPoints.size >= 2) {
+                            lineRenderer.updateBoxWireframe(
+                                cornerA = uiState.placedPoints[0],
+                                cornerB = uiState.placedPoints[1],
+                                isPreview = false
+                            )
+                        } else {
+                            lineRenderer.clearBoxWireframe()
+                        }
+                    }
+                    MeasureMode.RECTANGLE -> {
+                        lineRenderer.updateLivePreviewLine(null, null)
+                        if (uiState.stepState == MeasureStepState.Live && uiState.placedPoints.isNotEmpty()) {
+                            lineRenderer.updateRectangleWireframe(
+                                cornerA = uiState.placedPoints.first(),
+                                cornerB = hitUpdate.hitPoint,
+                                isPreview = true
+                            )
+                        } else if (uiState.stepState == MeasureStepState.Done && uiState.placedPoints.size >= 2) {
+                            lineRenderer.updateRectangleWireframe(
+                                cornerA = uiState.placedPoints[0],
+                                cornerB = uiState.placedPoints[1],
+                                isPreview = false
+                            )
+                        } else {
+                            lineRenderer.clearBoxWireframe()
+                        }
+                    }
+                    else -> {
+                        lineRenderer.clearBoxWireframe()
+                        if (uiState.stepState == MeasureStepState.Live && uiState.placedPoints.isNotEmpty()) {
+                            lineRenderer.updateLivePreviewLine(
+                                start = uiState.placedPoints.last(),
+                                end = hitUpdate.hitPoint
+                            )
+                        } else {
+                            lineRenderer.updateLivePreviewLine(null, null)
+                        }
+                    }
                 }
 
                 // Project 3D segments to 2D screen coordinates for crisp floating badges
@@ -390,12 +460,12 @@ fun MeasureCameraScreen(
             )
         }
 
-        // 5. Top Bar: Unit Chip, Status Pill, History & Settings Buttons
+        // 5. Top Bar: Unit Chip, Gyro Level Pill, Flashlight, Focus Lock, History & Settings Buttons
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
+                .padding(horizontal = 14.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Row(
@@ -406,7 +476,7 @@ fun MeasureCameraScreen(
                 // Unit Quick-Toggle Pill
                 GlassmorphicCard(
                     cornerRadius = 50.dp,
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 7.dp),
                     modifier = Modifier
                         .clickable {
                             if (settings.hapticFeedbackEnabled) {
@@ -423,65 +493,108 @@ fun MeasureCameraScreen(
                             imageVector = Icons.Rounded.Straighten,
                             contentDescription = null,
                             tint = ArYellow,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(16.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = settings.unit.symbol.uppercase(),
                             color = Color.White,
                             fontWeight = FontWeight.Bold,
-                            fontSize = 14.sp
+                            fontSize = 13.sp
                         )
                     }
                 }
 
-                // Mode Switcher Pills
-                Row(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(50))
-                        .background(Color(0xAA16161A))
-                        .border(1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(50))
-                        .padding(3.dp),
-                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                // Gyro Level Indicator Pill (iOS Measure Level)
+                val isLevel = levelData.isLevel
+                GlassmorphicCard(
+                    cornerRadius = 50.dp,
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
                 ) {
-                    MeasureMode.entries.forEach { mode ->
-                        val selected = uiState.mode == mode
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(50))
-                                .background(if (selected) ArYellow else Color.Transparent)
-                                .clickable {
-                                    if (settings.hapticFeedbackEnabled) {
-                                        localView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                                    }
-                                    lineRenderer.clearAll()
-                                    viewModel.setMeasureMode(mode)
-                                }
-                                .padding(horizontal = 11.dp, vertical = 6.dp)
-                        ) {
-                            Text(
-                                text = mode.label,
-                                color = if (selected) Color.Black else Color.White.copy(alpha = 0.85f),
-                                fontSize = 12.sp,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
-                            )
-                        }
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(if (isLevel) ArGreen else Color.White.copy(alpha = 0.5f))
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isLevel) "0° LEVEL" else "${levelData.inclinationDegrees}°",
+                            color = if (isLevel) ArGreen else Color.White.copy(alpha = 0.85f),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
                     }
                 }
 
-                // History & Settings Buttons
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                // Action Buttons: Flashlight, Focus Lock, History, Settings
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    // Flashlight / Torch toggle button
+                    FilledTonalIconButton(
+                        onClick = {
+                            val nextTorch = !uiState.isTorchEnabled
+                            activeSession?.let { arMeasureSession.setTorchMode(it, nextTorch) }
+                            viewModel.setTorchEnabled(nextTorch)
+                            if (settings.hapticFeedbackEnabled) {
+                                localView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                            }
+                        },
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = if (uiState.isTorchEnabled) ArYellow else Color(0xAA16161A),
+                            contentColor = if (uiState.isTorchEnabled) Color.Black else Color.White
+                        ),
+                        modifier = Modifier
+                            .size(38.dp)
+                            .semantics {
+                                contentDescription = if (uiState.isTorchEnabled) "Turn off flashlight" else "Turn on flashlight"
+                            }
+                    ) {
+                        Icon(
+                            imageVector = if (uiState.isTorchEnabled) Icons.Rounded.FlashlightOn else Icons.Rounded.FlashlightOff,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    // Focus Lock toggle button
+                    FilledTonalIconButton(
+                        onClick = {
+                            val nextLock = !uiState.isFocusLocked
+                            activeSession?.let { arMeasureSession.setFocusLock(it, nextLock) }
+                            viewModel.setFocusLocked(nextLock)
+                            if (settings.hapticFeedbackEnabled) {
+                                localView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                            }
+                        },
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = if (uiState.isFocusLocked) ArYellow else Color(0xAA16161A),
+                            contentColor = if (uiState.isFocusLocked) Color.Black else Color.White
+                        ),
+                        modifier = Modifier
+                            .size(38.dp)
+                            .semantics {
+                                contentDescription = if (uiState.isFocusLocked) "Unlock focus" else "Lock camera focus"
+                            }
+                    ) {
+                        Icon(
+                            imageVector = if (uiState.isFocusLocked) Icons.Rounded.Lock else Icons.Rounded.LockOpen,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
                     FilledTonalIconButton(
                         onClick = onOpenHistory,
                         colors = IconButtonDefaults.filledTonalIconButtonColors(
                             containerColor = Color(0xAA16161A),
                             contentColor = Color.White
                         ),
-                        modifier = Modifier.semantics {
-                            contentDescription = "Open measurement history"
-                        }
+                        modifier = Modifier
+                            .size(38.dp)
+                            .semantics { contentDescription = "Open measurement history" }
                     ) {
-                        Icon(Icons.Rounded.History, contentDescription = null)
+                        Icon(Icons.Rounded.History, contentDescription = null, modifier = Modifier.size(18.dp))
                     }
 
                     FilledTonalIconButton(
@@ -490,16 +603,53 @@ fun MeasureCameraScreen(
                             containerColor = Color(0xAA16161A),
                             contentColor = Color.White
                         ),
-                        modifier = Modifier.semantics {
-                            contentDescription = "Open settings"
-                        }
+                        modifier = Modifier
+                            .size(38.dp)
+                            .semantics { contentDescription = "Open settings" }
                     ) {
-                        Icon(Icons.Rounded.Tune, contentDescription = null)
+                        Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(14.dp))
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Mode Switcher Pills (Horizontal Scrollable)
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(Color(0xCC16161A))
+                    .border(1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(50))
+                    .padding(3.dp)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                MeasureMode.entries.forEach { mode ->
+                    val selected = uiState.mode == mode
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (selected) ArYellow else Color.Transparent)
+                            .clickable {
+                                if (settings.hapticFeedbackEnabled) {
+                                    localView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                                }
+                                lineRenderer.clearAll()
+                                viewModel.setMeasureMode(mode)
+                            }
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    ) {
+                        Text(
+                            text = mode.label,
+                            color = if (selected) Color.Black else Color.White.copy(alpha = 0.85f),
+                            fontSize = 12.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(10.dp))
 
             StatusInstructionPill(
                 text = uiState.instructionText,
@@ -507,40 +657,90 @@ fun MeasureCameraScreen(
                     uiState.stepState != MeasureStepState.Done
             )
 
-            // Live Total Banner during active measurement
+            // Live Total Banner & Multi-Dimension Display
             AnimatedVisibility(
                 visible = uiState.stepState == MeasureStepState.Live,
                 enter = fadeIn(),
                 exit = fadeOut()
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
                     GlassmorphicCard(
                         cornerRadius = 20.dp,
-                        contentPadding = PaddingValues(horizontal = 20.dp, vertical = 10.dp)
+                        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp)
                     ) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                text = UnitConverter.formatDistance(
-                                    uiState.activeDisplayMeters,
-                                    settings.unit
-                                ),
-                                style = TabularMeasureTextStyle.copy(
-                                    color = ArYellow,
-                                    fontSize = 26.sp
-                                )
-                            )
-                            if (uiState.polygonAreaSqMeters != null) {
-                                Text(
-                                    text = "Area: ${
-                                        UnitConverter.formatArea(
-                                            uiState.polygonAreaSqMeters!!,
-                                            settings.unit
+                            when (uiState.mode) {
+                                MeasureMode.BOX_3D -> {
+                                    val b = uiState.boxDimensions
+                                    if (b != null) {
+                                        Text(
+                                            text = "Vol: ${UnitConverter.formatVolume(b.volume, settings.unit)}",
+                                            style = TabularMeasureTextStyle.copy(
+                                                color = ArYellow,
+                                                fontSize = 22.sp
+                                            )
                                         )
-                                    }",
-                                    color = Color.White.copy(alpha = 0.8f),
-                                    fontSize = 13.sp
-                                )
+                                        Text(
+                                            text = "L: ${UnitConverter.formatDistance(b.length, settings.unit)}  •  W: ${UnitConverter.formatDistance(b.breadth, settings.unit)}  •  H: ${UnitConverter.formatDistance(b.height, settings.unit)}",
+                                            color = Color.White.copy(alpha = 0.9f),
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    } else {
+                                        Text(
+                                            text = "3D Box Frame",
+                                            style = TabularMeasureTextStyle.copy(color = ArYellow, fontSize = 20.sp)
+                                        )
+                                    }
+                                }
+                                MeasureMode.RECTANGLE -> {
+                                    val r = uiState.rectangleDimensions
+                                    if (r != null) {
+                                        Text(
+                                            text = "Area: ${UnitConverter.formatArea(r.area, settings.unit)}",
+                                            style = TabularMeasureTextStyle.copy(
+                                                color = ArYellow,
+                                                fontSize = 22.sp
+                                            )
+                                        )
+                                        Text(
+                                            text = "L: ${UnitConverter.formatDistance(r.length, settings.unit)}  •  W: ${UnitConverter.formatDistance(r.breadth, settings.unit)}",
+                                            color = Color.White.copy(alpha = 0.9f),
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    } else {
+                                        Text(
+                                            text = "Surface Frame",
+                                            style = TabularMeasureTextStyle.copy(color = ArYellow, fontSize = 20.sp)
+                                        )
+                                    }
+                                }
+                                else -> {
+                                    Text(
+                                        text = UnitConverter.formatDistance(
+                                            uiState.activeDisplayMeters,
+                                            settings.unit
+                                        ),
+                                        style = TabularMeasureTextStyle.copy(
+                                            color = ArYellow,
+                                            fontSize = 24.sp
+                                        )
+                                    )
+                                    if (uiState.polygonAreaSqMeters != null) {
+                                        Text(
+                                            text = "Area: ${
+                                                UnitConverter.formatArea(
+                                                    uiState.polygonAreaSqMeters!!,
+                                                    settings.unit
+                                                )
+                                            }",
+                                            color = Color.White.copy(alpha = 0.8f),
+                                            fontSize = 13.sp
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -679,7 +879,7 @@ fun MeasureCameraScreen(
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column {
+                            Column(modifier = Modifier.weight(1f)) {
                                 Text(
                                     text = uiState.mode.label.uppercase(),
                                     color = Color.White.copy(alpha = 0.65f),
@@ -687,21 +887,63 @@ fun MeasureCameraScreen(
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = formattedDistance,
-                                    style = TabularMeasureTextStyle.copy(
-                                        color = ArYellow,
-                                        fontSize = 34.sp
-                                    )
-                                )
-                                if (formattedArea != null) {
-                                    Text(
-                                        text = "Enclosed Area: $formattedArea",
-                                        style = TabularMeasureTextStyle.copy(
-                                            color = ArGreen,
-                                            fontSize = 16.sp
+                                when (uiState.mode) {
+                                    MeasureMode.BOX_3D -> {
+                                        val b = uiState.boxDimensions
+                                        if (b != null) {
+                                            Text(
+                                                text = UnitConverter.formatVolume(b.volume, settings.unit),
+                                                style = TabularMeasureTextStyle.copy(
+                                                    color = ArYellow,
+                                                    fontSize = 32.sp
+                                                )
+                                            )
+                                            Text(
+                                                text = "L: ${UnitConverter.formatDistance(b.length, settings.unit)}  •  W: ${UnitConverter.formatDistance(b.breadth, settings.unit)}  •  H: ${UnitConverter.formatDistance(b.height, settings.unit)}",
+                                                style = TabularMeasureTextStyle.copy(
+                                                    color = Color.White.copy(alpha = 0.9f),
+                                                    fontSize = 14.sp
+                                                )
+                                            )
+                                        }
+                                    }
+                                    MeasureMode.RECTANGLE -> {
+                                        val r = uiState.rectangleDimensions
+                                        if (r != null) {
+                                            Text(
+                                                text = UnitConverter.formatArea(r.area, settings.unit),
+                                                style = TabularMeasureTextStyle.copy(
+                                                    color = ArYellow,
+                                                    fontSize = 32.sp
+                                                )
+                                            )
+                                            Text(
+                                                text = "L: ${UnitConverter.formatDistance(r.length, settings.unit)}  •  W: ${UnitConverter.formatDistance(r.breadth, settings.unit)}",
+                                                style = TabularMeasureTextStyle.copy(
+                                                    color = Color.White.copy(alpha = 0.9f),
+                                                    fontSize = 14.sp
+                                                )
+                                            )
+                                        }
+                                    }
+                                    else -> {
+                                        Text(
+                                            text = formattedDistance,
+                                            style = TabularMeasureTextStyle.copy(
+                                                color = ArYellow,
+                                                fontSize = 34.sp
+                                            )
                                         )
-                                    )
+                                        if (formattedArea != null) {
+                                            Text(
+                                                text = "Enclosed Area: $formattedArea",
+                                                style = TabularMeasureTextStyle.copy(
+                                                    color = ArGreen,
+                                                    fontSize = 16.sp
+                                                )
+                                            )
+                                        }
+                                    }
                                 }
                             }
 
@@ -727,6 +969,24 @@ fun MeasureCameraScreen(
 
                         Spacer(modifier = Modifier.height(18.dp))
 
+                        val measurementSummary = when (uiState.mode) {
+                            MeasureMode.BOX_3D -> {
+                                val b = uiState.boxDimensions
+                                if (b != null) {
+                                    "${UnitConverter.formatVolume(b.volume, settings.unit)} (L: ${UnitConverter.formatDistance(b.length, settings.unit)} W: ${UnitConverter.formatDistance(b.breadth, settings.unit)} H: ${UnitConverter.formatDistance(b.height, settings.unit)})"
+                                } else formattedDistance
+                            }
+                            MeasureMode.RECTANGLE -> {
+                                val r = uiState.rectangleDimensions
+                                if (r != null) {
+                                    "${UnitConverter.formatArea(r.area, settings.unit)} (L: ${UnitConverter.formatDistance(r.length, settings.unit)} W: ${UnitConverter.formatDistance(r.breadth, settings.unit)})"
+                                } else formattedDistance
+                            }
+                            else -> {
+                                if (formattedArea != null) "$formattedDistance ($formattedArea)" else formattedDistance
+                            }
+                        }
+
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -736,16 +996,11 @@ fun MeasureCameraScreen(
                                 onClick = {
                                     scope.launch {
                                         val surface = arSceneViewRef
-                                        val summary = if (formattedArea != null) {
-                                            "$formattedDistance ($formattedArea)"
-                                        } else {
-                                            formattedDistance
-                                        }
                                         val bmp = if (surface != null) {
                                             BitmapShareHelper.captureArFrameWithOverlay(
                                                 surfaceView = surface,
                                                 segments = projectedSegments,
-                                                summaryText = summary
+                                                summaryText = measurementSummary
                                             )
                                         } else null
                                         val thumbPath = if (bmp != null) {
@@ -783,7 +1038,7 @@ fun MeasureCameraScreen(
                                 onClick = {
                                     scope.launch {
                                         val surface = arSceneViewRef ?: return@launch
-                                        val summary = "Measure AR: $formattedDistance"
+                                        val summary = "Measure AR: $measurementSummary"
                                         val bitmap = BitmapShareHelper.captureArFrameWithOverlay(
                                             surfaceView = surface,
                                             segments = projectedSegments,
