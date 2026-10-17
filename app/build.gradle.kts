@@ -23,9 +23,26 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("measure_ar_release.keystore")
+            storePassword = "measurearpass"
+            keyAlias = "measurear"
+            keyPassword = "measurearpass"
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
+            enableV4Signing = true
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("release")
+        }
         release {
-            isMinifyEnabled = true
+            isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
