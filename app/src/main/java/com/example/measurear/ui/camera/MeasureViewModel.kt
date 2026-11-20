@@ -148,9 +148,27 @@ class MeasureViewModel @Inject constructor(
         isEdgeSnapped: Boolean,
         trackingHint: TrackingQualityHint
     ) {
-        _uiState.update { current ->
-            if (current.stepState == MeasureStepState.Done) {
-                return@update current.copy(
+        val current = _uiState.value
+
+        // Throttle minor micro-jitter updates if values haven't meaningfully changed
+        val lastPoint = current.reticlePoint
+        val movedSignificantly = if (hitPoint != null && lastPoint != null) {
+            DistanceCalculator.calculateEuclideanDistance(lastPoint, hitPoint) > 0.003f
+        } else {
+            hitPoint != lastPoint
+        }
+
+        if (!movedSignificantly &&
+            current.isReticleLocked == isPlaneLocked &&
+            current.isEdgeSnapped == isEdgeSnapped &&
+            current.trackingHint == trackingHint
+        ) {
+            return
+        }
+
+        _uiState.update { curr ->
+            if (curr.stepState == MeasureStepState.Done) {
+                return@update curr.copy(
                     reticlePoint = hitPoint,
                     isReticleLocked = isPlaneLocked,
                     isEdgeSnapped = isEdgeSnapped,
@@ -159,24 +177,16 @@ class MeasureViewModel @Inject constructor(
             }
 
             val nextStep = when {
-                current.placedPoints.isEmpty() -> {
+                curr.placedPoints.isEmpty() -> {
                     if (hitPoint != null) MeasureStepState.ReadyToPlaceA else MeasureStepState.Searching
                 }
                 hitPoint == null -> MeasureStepState.PlacedA
-                else -> {
-                    val lastPoint = current.placedPoints.last()
-                    val delta = DistanceCalculator.calculateEuclideanDistance(lastPoint, hitPoint)
-                    if (delta > 0.005f || current.stepState == MeasureStepState.Live) {
-                        MeasureStepState.Live
-                    } else {
-                        MeasureStepState.PlacedA
-                    }
-                }
+                else -> MeasureStepState.Live
             }
 
-            val liveDistance = if (current.placedPoints.isNotEmpty() && hitPoint != null) {
-                val last = current.placedPoints.last()
-                if (current.mode == MeasureMode.HEIGHT) {
+            val liveDistance = if (curr.placedPoints.isNotEmpty() && hitPoint != null) {
+                val last = curr.placedPoints.last()
+                if (curr.mode == MeasureMode.HEIGHT) {
                     DistanceCalculator.calculateVerticalHeight(last, hitPoint)
                 } else {
                     DistanceCalculator.calculateEuclideanDistance(last, hitPoint)
@@ -185,23 +195,23 @@ class MeasureViewModel @Inject constructor(
                 0f
             }
 
-            val liveBox = if (current.mode == MeasureMode.BOX_3D && current.placedPoints.isNotEmpty() && hitPoint != null) {
-                DistanceCalculator.calculateBoundingBox(current.placedPoints.first(), hitPoint)
+            val liveBox = if (curr.mode == MeasureMode.BOX_3D && curr.placedPoints.isNotEmpty() && hitPoint != null) {
+                DistanceCalculator.calculateBoundingBox(curr.placedPoints.first(), hitPoint)
             } else null
 
-            val liveRect = if (current.mode == MeasureMode.RECTANGLE && current.placedPoints.isNotEmpty() && hitPoint != null) {
-                DistanceCalculator.calculateRectangleDimensions(current.placedPoints.first(), hitPoint)
+            val liveRect = if (curr.mode == MeasureMode.RECTANGLE && curr.placedPoints.isNotEmpty() && hitPoint != null) {
+                DistanceCalculator.calculateRectangleDimensions(curr.placedPoints.first(), hitPoint)
             } else null
 
-            current.copy(
+            curr.copy(
                 stepState = nextStep,
                 reticlePoint = hitPoint,
                 isReticleLocked = isPlaneLocked,
                 isEdgeSnapped = isEdgeSnapped,
                 trackingHint = trackingHint,
                 liveSegmentMeters = liveDistance,
-                boxDimensions = liveBox ?: current.boxDimensions,
-                rectangleDimensions = liveRect ?: current.rectangleDimensions
+                boxDimensions = liveBox ?: curr.boxDimensions,
+                rectangleDimensions = liveRect ?: curr.rectangleDimensions
             )
         }
     }
@@ -213,11 +223,18 @@ class MeasureViewModel @Inject constructor(
     fun onAddPointClicked(): Point3D? {
         val state = _uiState.value
         val targetPoint = state.reticlePoint ?: return null
-        if (state.stepState == MeasureStepState.Done || state.stepState == MeasureStepState.Searching) {
+        if (state.stepState == MeasureStepState.Searching) {
             return null
         }
 
-        val updatedPoints = state.placedPoints + targetPoint
+        // If previously Done, tapping + seamlessly starts a fresh measurement at the current reticle
+        val basePoints = if (state.stepState == MeasureStepState.Done) {
+            emptyList()
+        } else {
+            state.placedPoints
+        }
+
+        val updatedPoints = basePoints + targetPoint
         recalculateStateForPoints(updatedPoints, state.mode, forceFinish = false)
         return targetPoint
     }

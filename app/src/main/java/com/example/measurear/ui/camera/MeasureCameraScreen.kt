@@ -13,7 +13,6 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -194,7 +193,6 @@ fun MeasureCameraScreen(
     var arSceneViewRef by remember { mutableStateOf<ARSceneView?>(null) }
     var viewportSize by remember { mutableStateOf(IntSize.Zero) }
     var projectedSegments by remember { mutableStateOf<List<OverlaySegment2D>>(emptyList()) }
-    var detectedSurfaceDots by remember { mutableStateOf<List<Pair<Float, Float>>>(emptyList()) }
     var wasEdgeSnapped by remember { mutableStateOf(false) }
 
     val gyroSensor = remember { GyroOrientationSensor(context) }
@@ -227,14 +225,14 @@ fun MeasureCameraScreen(
             .background(Color.Black)
             .onSizeChanged { viewportSize = it }
     ) {
-        // 1. Full-Screen ARSceneView
+        // 1. Full-Screen ARSceneView (Hardware-accelerated Filament 3D rendering)
         ARScene(
             modifier = Modifier.fillMaxSize(),
             engine = engine,
             materialLoader = materialLoader,
             cameraNode = cameraNode,
             childNodes = childNodes,
-            planeRenderer = false, // We draw a custom subtle iOS-style dot grid
+            planeRenderer = settings.showSurfaceGrid, // SceneView's hardware plane renderer
             sessionConfiguration = { session, config ->
                 activeSession = session
                 config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
@@ -357,80 +355,10 @@ fun MeasureCameraScreen(
                         isPreview = seg.isPreview
                     )
                 }
-
-                // Generate subtle dot grid over detected planes when enabled
-                if (settings.showSurfaceGrid && camera.trackingState == TrackingState.TRACKING) {
-                    val dots = mutableListOf<Pair<Float, Float>>()
-                    val planes = session.getAllTrackables(Plane::class.java)
-                    for (plane in planes) {
-                        if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) continue
-                        val center = plane.centerPose
-                        val step = 0.18f
-                        val extX = (plane.extentX * 0.45f).coerceAtMost(0.9f)
-                        val extZ = (plane.extentZ * 0.45f).coerceAtMost(0.9f)
-                        var x = -extX
-                        while (x <= extX) {
-                            var z = -extZ
-                            while (z <= extZ) {
-                                val worldPt = center.transformPoint(floatArrayOf(x, 0f, z))
-                                val screenPt = lineRenderer.projectWorldToScreen(
-                                    camera = camera,
-                                    viewportWidth = viewportSize.width,
-                                    viewportHeight = viewportSize.height,
-                                    point = Point3D(worldPt[0], worldPt[1], worldPt[2])
-                                )
-                                if (screenPt != null) {
-                                    dots.add(screenPt)
-                                }
-                                z += step
-                            }
-                            x += step
-                        }
-                    }
-                    detectedSurfaceDots = dots
-                } else {
-                    detectedSurfaceDots = emptyList()
-                }
             }
         )
 
-        // 2. Subtle Surface Dot Grid & 2D Crisp Line Overlay
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            // Subtle iOS-style surface dot grid
-            for (dot in detectedSurfaceDots) {
-                drawCircle(
-                    color = Color.White.copy(alpha = 0.28f),
-                    radius = 2.5.dp.toPx(),
-                    center = Offset(dot.first, dot.second)
-                )
-            }
-
-            // Projected measurement lines and anchor dots
-            for (seg in projectedSegments) {
-                drawLine(
-                    color = if (seg.isPreview) ArGreen else ArYellow,
-                    start = Offset(seg.startX, seg.startY),
-                    end = Offset(seg.endX, seg.endY),
-                    strokeWidth = 3.dp.toPx(),
-                    cap = StrokeCap.Round,
-                    pathEffect = if (seg.isPreview) {
-                        PathEffect.dashPathEffect(floatArrayOf(18f, 12f), 0f)
-                    } else null
-                )
-                drawCircle(
-                    color = Color.White,
-                    radius = 5.dp.toPx(),
-                    center = Offset(seg.startX, seg.startY)
-                )
-                drawCircle(
-                    color = Color.White,
-                    radius = 5.dp.toPx(),
-                    center = Offset(seg.endX, seg.endY)
-                )
-            }
-        }
-
-        // 3. Floating Live Distance Labels anchored to each 3D segment midpoint
+        // 2. Floating Live Distance Labels anchored to each 3D segment midpoint
         val density = LocalDensity.current
         projectedSegments.forEach { seg ->
             val midX = ((seg.startX + seg.endX) * 0.5f).roundToInt()

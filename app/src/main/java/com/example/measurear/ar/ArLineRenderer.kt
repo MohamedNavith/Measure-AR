@@ -162,11 +162,17 @@ class ArLineRenderer(
     }
 
     private fun quaternionFromUnitYToVector(vx: Float, vy: Float, vz: Float): Quaternion {
-        val dot = vy
+        val dot = vy.coerceIn(-1.0f, 1.0f)
         if (dot < -0.9999f) {
             return Quaternion(1f, 0f, 0f, 0f)
         }
-        val s = sqrt((1f + dot) * 2f)
+        if (dot > 0.9999f) {
+            return Quaternion(0f, 0f, 0f, 1f)
+        }
+        val s = sqrt(maxOf(0f, (1f + dot) * 2f))
+        if (s < 0.0001f) {
+            return Quaternion(0f, 0f, 0f, 1f)
+        }
         val invS = 1f / s
         return Quaternion(
             x = vz * invS,
