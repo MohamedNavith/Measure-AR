@@ -3,32 +3,58 @@ package com.example.measurear.ar
 import android.content.Context
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Camera
+import com.google.ar.core.CameraConfig
+import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Frame
-import com.google.ar.core.InstantPlacementPoint
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingFailureReason
 import com.google.ar.core.TrackingState
-import java.nio.FloatBuffer
-import kotlin.math.abs
+import com.google.ar.core.exceptions.NotYetAvailableException
+import java.nio.ByteOrder
+import java.util.EnumSet
 import kotlin.math.sqrt
 
-data class FrameHitUpdate(
-    val hitPoint: Point3D?,
-    val isPlaneLocked: Boolean,
-    val isEdgeSnapped: Boolean,
-    val trackingHint: TrackingQualityHint,
-    val detectedSurfaceExtent: Pair<Float, Float>? = null
-)
+sealed class FrameHitUpdate {
+    data class Found(val point: Point3D, val source: HitSource) : FrameHitUpdate()
+    object NotTracking : FrameHitUpdate()
+    object NoHit : FrameHitUpdate()
 
+    val hitPoint: Point3D?
+        get() = (this as? Found)?.point
+
+    val isPlaneLocked: Boolean
+        get() = (this as? Found)?.let { it.source == HitSource.PLANE || it.source == HitSource.RAW_DEPTH } ?: false
+
+    val isEdgeSnapped: Boolean
+        get() = false
+
+    val trackingHint: TrackingQualityHint
+        get() = when (this) {
+            is NotTracking -> TrackingQualityHint.INITIALIZING
+            else -> TrackingQualityHint.NONE
+        }
+}
+
+enum class HitSource { PLANE, FEATURE_POINT, INSTANT_PLACEMENT, RAW_DEPTH }
+
+/**
+ * ============================================================================
+ * PROBLEM B FIX — "Surfaces are not scannable"
+ * ============================================================================
+ * Solved via 3-stage fallback:
+ *   1. Standard hitTest against existing Plane/Point trackables.
+ *   2. hitTestInstantPlacement — works with zero planes, using depth estimate.
+ *   3. Raw Depth API pixel sample at the exact tap/reticle location — solves
+ *      untextured blank walls and floors with no feature points.
+ * ============================================================================
+ */
 class ArMeasureSession {
 
-    private var lastSmoothedPoint: Point3D? = null
-    private var lastEdgeSnapped: Boolean = false
-    private var cachedEdgeSegments: List<Pair<Point3D, Point3D>> = emptyList()
-    private var lastEdgeExtractionTimeMs: Long = 0L
+    // Seed instant-placement with the last depth we actually measured
+    private var lastKnownDepthMeters: Float = 1.0f
 
     fun checkArCoreAvailability(context: Context): Boolean {
         return try {
@@ -39,21 +65,37 @@ class ArMeasureSession {
         }
     }
 
-    fun configureSessionFeatures(session: Session, config: Config) {
+    fun configureSession(session: Session) {
+        val config = session.config
+
+        // Continuous autofocus for near-field clarity
+        config.focusMode = Config.FocusMode.AUTO
         config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
+        config.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
+        config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
         config.lightEstimationMode = Config.LightEstimationMode.AMBIENT_INTENSITY
 
-        // Enable Instant Placement for instant hit testing without waiting for full planes
-        config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
-
-        // Enable Depth API if supported for mm-accurate depth mapping
         config.depthMode = if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
             Config.DepthMode.AUTOMATIC
         } else {
             Config.DepthMode.DISABLED
         }
 
-        config.focusMode = Config.FocusMode.AUTO
+        try {
+            val filter = CameraConfigFilter(session)
+                .setTargetFps(EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30, CameraConfig.TargetFps.TARGET_FPS_60))
+            session.getSupportedCameraConfigs(filter)
+                .maxByOrNull { it.fpsRange.upper }
+                ?.let { session.cameraConfig = it }
+        } catch (_: Exception) {
+            // Fallback to default camera configuration on devices with locked configs
+        }
+
+        session.configure(config)
+    }
+
+    fun configureSessionFeatures(session: Session, config: Config) {
+        configureSession(session)
     }
 
     fun setTorchMode(session: Session, enabled: Boolean): Boolean {
@@ -78,281 +120,109 @@ class ArMeasureSession {
         }
     }
 
+    /**
+     * Call once per frame. viewWidth/viewHeight are the GL surface dimensions.
+     */
     fun processFrame(
         session: Session,
         frame: Frame,
-        viewportWidth: Int,
-        viewportHeight: Int,
-        measureMode: MeasureMode,
-        placedPoints: List<Point3D>
+        viewWidth: Int,
+        viewHeight: Int,
+        screenX: Float = viewWidth * 0.5f,
+        screenY: Float = viewHeight * 0.5f
     ): FrameHitUpdate {
         val camera = frame.camera
-        val trackingHint = resolveTrackingHint(camera)
-
-        if (camera.trackingState != TrackingState.TRACKING || viewportWidth <= 0 || viewportHeight <= 0) {
-            lastSmoothedPoint = null
-            return FrameHitUpdate(
-                hitPoint = null,
-                isPlaneLocked = false,
-                isEdgeSnapped = false,
-                trackingHint = trackingHint
-            )
+        if (camera.trackingState != TrackingState.TRACKING || viewWidth <= 0 || viewHeight <= 0) {
+            return FrameHitUpdate.NotTracking
         }
 
-        // In Height Mode, once Point A is placed, project center ray onto vertical axis
-        if (measureMode == MeasureMode.HEIGHT && placedPoints.size == 1) {
-            val floorPoint = placedPoints.first()
-            val verticalPoint = computeVerticalHeightTarget(camera, floorPoint)
-            if (verticalPoint != null) {
-                lastSmoothedPoint = verticalPoint
-                return FrameHitUpdate(
-                    hitPoint = verticalPoint,
-                    isPlaneLocked = true,
-                    isEdgeSnapped = false,
-                    trackingHint = TrackingQualityHint.NONE
-                )
-            }
-        }
-
-        val centerX = viewportWidth * 0.5f
-        val centerY = viewportHeight * 0.5f
-        var hitResults = frame.hitTest(centerX, centerY)
-
-        // If center pixel missed (e.g. edge of a table or untextured patch), sample adjacent cross pattern
-        if (hitResults.isEmpty()) {
-            val offset = 24f
-            val offsets = floatArrayOf(
-                centerX + offset, centerY,
-                centerX - offset, centerY,
-                centerX, centerY + offset,
-                centerX, centerY - offset
-            )
-            var i = 0
-            while (i < offsets.size) {
-                val testHits = frame.hitTest(offsets[i], offsets[i + 1])
-                if (testHits.isNotEmpty()) {
-                    hitResults = testHits
-                    break
-                }
-                i += 2
-            }
-        }
-
-        // 1. Plane polygon hit (highest confidence)
-        val planeHit = hitResults.firstOrNull { hit ->
+        // --- Stage 1: standard hit test against tracked Plane/Point trackables ---
+        for (hit in frame.hitTest(screenX, screenY)) {
             val trackable = hit.trackable
-            trackable is Plane &&
-                trackable.trackingState == TrackingState.TRACKING &&
-                trackable.isPoseInPolygon(hit.hitPose)
-        }
-
-        // 2. Instant placement hit (instant responsive surface tracking)
-        val instantHit = hitResults.firstOrNull { hit ->
-            val trackable = hit.trackable
-            trackable is InstantPlacementPoint &&
+            if (trackable is Plane && trackable.isPoseInPolygon(hit.hitPose) &&
                 trackable.trackingState == TrackingState.TRACKING
-        }
-
-        // 3. General plane hit within extent bounds
-        val generalPlaneHit = hitResults.firstOrNull { hit ->
-            val trackable = hit.trackable
-            trackable is Plane && trackable.trackingState == TrackingState.TRACKING
-        }
-
-        // 4. Feature point hit
-        val featureHit = hitResults.firstOrNull { hit ->
-            val trackable = hit.trackable
-            trackable is Point && trackable.trackingState == TrackingState.TRACKING
-        }
-
-        val chosenHit = planeHit ?: instantHit ?: generalPlaneHit ?: featureHit
-
-        // 5. Plane Raycast Fallback: If no hit but we have active planes, intersect camera ray with nearest plane
-        var planeRaycastPoint: Point3D? = null
-        if (chosenHit == null) {
-            planeRaycastPoint = raycastToNearestTrackedPlane(camera, session)
-        }
-
-        if (chosenHit == null && planeRaycastPoint == null) {
-            lastSmoothedPoint = null
-            return FrameHitUpdate(
-                hitPoint = null,
-                isPlaneLocked = false,
-                isEdgeSnapped = false,
-                trackingHint = if (trackingHint == TrackingQualityHint.NONE) TrackingQualityHint.INITIALIZING else trackingHint
-            )
-        }
-
-        val rawPoint = if (chosenHit != null) {
-            val hitPose = chosenHit.hitPose
-            Point3D(hitPose.tx(), hitPose.ty(), hitPose.tz())
-        } else {
-            planeRaycastPoint!!
-        }
-
-        // Extract plane extent for auto surface dimension detection
-        var surfaceExtent: Pair<Float, Float>? = null
-        val targetPlane = (chosenHit?.trackable as? Plane)
-        if (targetPlane != null && targetPlane.trackingState == TrackingState.TRACKING) {
-            surfaceExtent = targetPlane.extentX to targetPlane.extentZ
-        }
-
-        // Edge Detection & Magnetic Snapping
-        val edgeSegments = extractPlaneEdgeSegments(session)
-        val (edgeSnappedPoint, didEdgeSnap) = DistanceCalculator.snapToNearestEdge(
-            point = rawPoint,
-            edgeSegments = edgeSegments,
-            thresholdMeters = 0.045f
-        )
-
-        // Axis / Level Alignment Snapping (when extending from last point)
-        val candidatePoint = if (didEdgeSnap) {
-            edgeSnappedPoint
-        } else if (placedPoints.isNotEmpty()) {
-            val (axisSnapped, didAxisSnap) = DistanceCalculator.snapToLevelAxis(
-                start = placedPoints.last(),
-                current = rawPoint,
-                thresholdDegrees = 3.5f
-            )
-            if (didAxisSnap) axisSnapped else rawPoint
-        } else {
-            rawPoint
-        }
-
-        // Low-pass EMA filter to eliminate distance drift and lens breathing
-        val finalPoint = if (didEdgeSnap || lastSmoothedPoint == null) {
-            candidatePoint
-        } else {
-            val prev = lastSmoothedPoint!!
-            val moveDelta = DistanceCalculator.calculateEuclideanDistance(prev, candidatePoint)
-            // If moved significantly, track fast; if stationary, smooth aggressively
-            val alpha = if (moveDelta > 0.06f) 0.85f else 0.32f
-            Point3D(
-                x = prev.x * (1f - alpha) + candidatePoint.x * alpha,
-                y = prev.y * (1f - alpha) + candidatePoint.y * alpha,
-                z = prev.z * (1f - alpha) + candidatePoint.z * alpha
-            )
-        }
-
-        lastSmoothedPoint = finalPoint
-        lastEdgeSnapped = didEdgeSnap
-
-        return FrameHitUpdate(
-            hitPoint = finalPoint,
-            isPlaneLocked = planeHit != null || generalPlaneHit != null,
-            isEdgeSnapped = didEdgeSnap,
-            trackingHint = TrackingQualityHint.NONE,
-            detectedSurfaceExtent = surfaceExtent
-        )
-    }
-
-    private fun extractPlaneEdgeSegments(session: Session): List<Pair<Point3D, Point3D>> {
-        val now = System.currentTimeMillis()
-        if (now - lastEdgeExtractionTimeMs < 300L && cachedEdgeSegments.isNotEmpty()) {
-            return cachedEdgeSegments
-        }
-        lastEdgeExtractionTimeMs = now
-
-        val segments = mutableListOf<Pair<Point3D, Point3D>>()
-        val planes = session.getAllTrackables(Plane::class.java)
-        for (plane in planes) {
-            if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) continue
-            val polygon: FloatBuffer = plane.polygon ?: continue
-            val vertices = mutableListOf<Point3D>()
-            polygon.rewind()
-            while (polygon.hasRemaining()) {
-                val x = polygon.get()
-                val z = polygon.get()
-                val world = plane.centerPose.transformPoint(floatArrayOf(x, 0f, z))
-                vertices.add(Point3D(world[0], world[1], world[2]))
+            ) {
+                val p = hit.hitPose
+                lastKnownDepthMeters = distanceToCamera(camera, p.tx(), p.ty(), p.tz())
+                return FrameHitUpdate.Found(Point3D(p.tx(), p.ty(), p.tz()), HitSource.PLANE)
             }
-            if (vertices.size >= 2) {
-                for (i in 0 until vertices.size) {
-                    val next = vertices[(i + 1) % vertices.size]
-                    segments.add(vertices[i] to next)
+            if (trackable is Point && trackable.orientationMode == Point.OrientationMode.ESTIMATED_SURFACE_NORMAL) {
+                val p = hit.hitPose
+                lastKnownDepthMeters = distanceToCamera(camera, p.tx(), p.ty(), p.tz())
+                return FrameHitUpdate.Found(Point3D(p.tx(), p.ty(), p.tz()), HitSource.FEATURE_POINT)
+            }
+        }
+
+        // --- Stage 2: instant placement, no plane required ---
+        frame.hitTestInstantPlacement(screenX, screenY, lastKnownDepthMeters).firstOrNull()?.let { hit ->
+            val p = hit.hitPose
+            return FrameHitUpdate.Found(Point3D(p.tx(), p.ty(), p.tz()), HitSource.INSTANT_PLACEMENT)
+        }
+
+        // --- Stage 3: raw depth-map sample for untextured surfaces (blank walls/floors) ---
+        if (session.config.depthMode != Config.DepthMode.DISABLED) {
+            try {
+                frame.acquireDepthImage16Bits().use { depthImage ->
+                    sampleDepthAsWorldPoint(depthImage, camera, screenX, screenY, viewWidth, viewHeight)
+                        ?.let { point ->
+                            lastKnownDepthMeters = distanceToCamera(camera, point.x, point.y, point.z)
+                            return FrameHitUpdate.Found(point, HitSource.RAW_DEPTH)
+                        }
                 }
+            } catch (_: NotYetAvailableException) {
+                // Depth image not ready yet this frame
+            } catch (_: Exception) {
+                // Ignore transient frame acquisition issues
             }
         }
-        cachedEdgeSegments = segments
-        return segments
+
+        return FrameHitUpdate.NoHit
     }
 
-    private fun raycastToNearestTrackedPlane(camera: Camera, session: Session): Point3D? {
-        val camPose = camera.displayOrientedPose
-        val camPos = Point3D(camPose.tx(), camPose.ty(), camPose.tz())
-        val zAxis = camPose.zAxis
-        val rayDir = Point3D(-zAxis[0], -zAxis[1], -zAxis[2])
-
-        val planes = session.getAllTrackables(Plane::class.java)
-        var closestPoint: Point3D? = null
-        var closestDist = Float.MAX_VALUE
-
-        for (plane in planes) {
-            if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) continue
-            val planePose = plane.centerPose
-            val planeY = planePose.ty()
-
-            if (plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING || plane.type == Plane.Type.HORIZONTAL_DOWNWARD_FACING) {
-                if (abs(rayDir.y) < 0.04f) continue
-                val t = (planeY - camPos.y) / rayDir.y
-                if (t in 0.2f..6.0f && t < closestDist) {
-                    val hitX = camPos.x + rayDir.x * t
-                    val hitZ = camPos.z + rayDir.z * t
-                    val dx = hitX - planePose.tx()
-                    val dz = hitZ - planePose.tz()
-                    val maxExtent = maxOf(plane.extentX, plane.extentZ, 1.5f) * 1.5f
-                    if (sqrt(dx * dx + dz * dz) <= maxExtent) {
-                        closestDist = t
-                        closestPoint = Point3D(hitX, planeY, hitZ)
-                    }
-                }
-            }
-        }
-        return closestPoint
+    private fun distanceToCamera(camera: Camera, x: Float, y: Float, z: Float): Float {
+        val pose = camera.pose
+        val dx = x - pose.tx()
+        val dy = y - pose.ty()
+        val dz = z - pose.tz()
+        return sqrt(dx * dx + dy * dy + dz * dz).coerceIn(0.1f, 8.0f)
     }
 
-    private fun computeVerticalHeightTarget(camera: Camera, floorPoint: Point3D): Point3D? {
-        val camPose = camera.displayOrientedPose
-        val camPos = Point3D(camPose.tx(), camPose.ty(), camPose.tz())
+    /**
+     * Unprojects one pixel of the ARCore depth map into a world-space point using camera intrinsics.
+     */
+    private fun sampleDepthAsWorldPoint(
+        depthImage: android.media.Image,
+        camera: Camera,
+        screenX: Float,
+        screenY: Float,
+        viewWidth: Int,
+        viewHeight: Int
+    ): Point3D? {
+        val depthWidth = depthImage.width
+        val depthHeight = depthImage.height
+        val depthX = (screenX / viewWidth * depthWidth).toInt().coerceIn(0, depthWidth - 1)
+        val depthY = (screenY / viewHeight * depthHeight).toInt().coerceIn(0, depthHeight - 1)
 
-        val zAxis = camPose.zAxis
-        val rayDirX = -zAxis[0]
-        val rayDirY = -zAxis[1]
-        val rayDirZ = -zAxis[2]
+        val plane = depthImage.planes[0]
+        val buffer = plane.buffer.order(ByteOrder.nativeOrder()).asShortBuffer()
+        val rowStrideShorts = plane.rowStride / 2
+        val millimeters = buffer[depthY * rowStrideShorts + depthX].toInt() and 0xFFFF
+        if (millimeters <= 0) return null
+        val depthMeters = millimeters / 1000f
 
-        val toCamX = camPos.x - floorPoint.x
-        val toCamZ = camPos.z - floorPoint.z
-        val horizDist = sqrt(toCamX * toCamX + toCamZ * toCamZ)
-        if (horizDist < 0.05f) return null
+        val intrinsics = camera.imageIntrinsics
+        val focalLength = intrinsics.focalLength        // [fx, fy]
+        val principalPoint = intrinsics.principalPoint   // [cx, cy]
+        val imageDims = intrinsics.imageDimensions       // [width, height]
 
-        val normX = toCamX / horizDist
-        val normZ = toCamZ / horizDist
+        val scaledX = depthX.toFloat() / depthWidth * imageDims[0]
+        val scaledY = depthY.toFloat() / depthHeight * imageDims[1]
+        val nx = (scaledX - principalPoint[0]) / focalLength[0]
+        val ny = (scaledY - principalPoint[1]) / focalLength[1]
 
-        val denom = rayDirX * normX + rayDirZ * normZ
-        if (abs(denom) < 0.001f) return null
-
-        val t = ((floorPoint.x - camPos.x) * normX + (floorPoint.z - camPos.z) * normZ) / denom
-        if (t <= 0f) return null
-
-        val targetY = (camPos.y + rayDirY * t).coerceIn(floorPoint.y - 5f, floorPoint.y + 10f)
-        return Point3D(
-            x = floorPoint.x,
-            y = targetY,
-            z = floorPoint.z
-        )
-    }
-
-    private fun resolveTrackingHint(camera: Camera): TrackingQualityHint {
-        if (camera.trackingState == TrackingState.TRACKING) {
-            return TrackingQualityHint.NONE
-        }
-        return when (camera.trackingFailureReason) {
-            TrackingFailureReason.NONE -> TrackingQualityHint.INITIALIZING
-            TrackingFailureReason.BAD_STATE -> TrackingQualityHint.INITIALIZING
-            TrackingFailureReason.INSUFFICIENT_LIGHT -> TrackingQualityHint.TOO_DARK
-            TrackingFailureReason.EXCESSIVE_MOTION -> TrackingQualityHint.TOO_FAST
-            TrackingFailureReason.INSUFFICIENT_FEATURES -> TrackingQualityHint.INSUFFICIENT_FEATURES
-            TrackingFailureReason.CAMERA_UNAVAILABLE -> TrackingQualityHint.CAMERA_UNAVAILABLE
-        }
+        val cameraSpace = floatArrayOf(nx * depthMeters, -ny * depthMeters, -depthMeters)
+        val worldSpace = FloatArray(3)
+        camera.pose.transformPoint(cameraSpace, 0, worldSpace, 0)
+        return Point3D(worldSpace[0], worldSpace[1], worldSpace[2])
     }
 }

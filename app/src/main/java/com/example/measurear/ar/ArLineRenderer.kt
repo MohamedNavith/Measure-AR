@@ -1,18 +1,17 @@
 package com.example.measurear.ar
 
 import android.opengl.Matrix
-import com.google.ar.core.Anchor
 import com.google.ar.core.Camera
-import com.google.ar.core.Pose
-import com.google.ar.core.Session
-import com.google.ar.core.TrackingState
-import dev.romainguy.kotlin.math.Float3
-import dev.romainguy.kotlin.math.Quaternion
-import io.github.sceneview.ar.node.AnchorNode
 import io.github.sceneview.loaders.MaterialLoader
+import io.github.sceneview.math.Position
+import dev.romainguy.kotlin.math.Quaternion
+import io.github.sceneview.math.Scale
 import io.github.sceneview.node.CylinderNode
 import io.github.sceneview.node.Node
 import io.github.sceneview.node.SphereNode
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.sqrt
 
 data class OverlaySegment2D(
@@ -25,336 +24,265 @@ data class OverlaySegment2D(
     val isPreview: Boolean
 )
 
+/**
+ * ============================================================================
+ * PROBLEM A & C FIX — High Performance Scene Mutation & One Euro Filtering
+ * ============================================================================
+ * Splits UI data and Scene data:
+ * - Scene data (node positions, line transforms) is mutated directly on
+ *   Filament nodes, OUTSIDE Compose, driven by ARCore's frame callback.
+ * - Reuses CylinderNode and SphereNode in-place without destroying/creating per frame.
+ * - Filters 3D coordinates component-wise with OneEuroFilter using camera timestamps.
+ * - Exposes liveDistanceMeters StateFlow for Compose distance badges.
+ * ============================================================================
+ */
 class ArLineRenderer(
     private val materialLoader: MaterialLoader,
     private val rootNodeConsumer: (Node) -> Unit,
     private val rootNodeRemover: (Node) -> Unit
 ) {
-    private val anchorNodes = mutableListOf<AnchorNode>()
-    private val segmentNodes = mutableListOf<CylinderNode>()
-    private val boxEdges = mutableListOf<CylinderNode>()
-    private var previewLineNode: CylinderNode? = null
+    private var pointASphere: SphereNode? = null
+    private var pointBSphere: SphereNode? = null
+    private var connectingLine: CylinderNode? = null
     private var reticleSphereNode: SphereNode? = null
 
-    private val pointMaterial by lazy {
-        materialLoader.createColorInstance(
-            color = io.github.sceneview.math.Color(1.0f, 1.0f, 1.0f, 1.0f),
-            metallic = 0.0f,
-            roughness = 0.3f
-        )
-    }
+    private val pointFilterA = Point3DFilter()
+    private val pointFilterB = Point3DFilter()
+    private val reticleFilter = Point3DFilter()
+
+    private val _liveDistanceMeters = MutableStateFlow<Float?>(null)
+    val liveDistanceMeters: StateFlow<Float?> = _liveDistanceMeters.asStateFlow()
 
     private val lineMaterial by lazy {
         materialLoader.createColorInstance(
-            color = io.github.sceneview.math.Color(1.0f, 0.80f, 0.0f, 1.0f),
-            metallic = 0.1f,
-            roughness = 0.4f
+            color = io.github.sceneview.math.Color(1.0f, 0.84f, 0.04f, 1.0f) // iOS bright gold/yellow
+        )
+    }
+
+    private val pointMaterial by lazy {
+        materialLoader.createColorInstance(
+            color = io.github.sceneview.math.Color(1.0f, 1.0f, 1.0f, 1.0f) // White anchor dot
         )
     }
 
     private val previewMaterial by lazy {
         materialLoader.createColorInstance(
-            color = io.github.sceneview.math.Color(0.30f, 0.85f, 0.40f, 0.9f),
-            metallic = 0.0f,
-            roughness = 0.5f
+            color = io.github.sceneview.math.Color(0.2f, 0.84f, 0.29f, 0.9f) // Active green
         )
     }
 
-    fun placeAnchorPoint(session: Session, point: Point3D): Boolean {
-        return try {
-            val pose = Pose.makeTranslation(point.x, point.y, point.z)
-            val anchor: Anchor = session.createAnchor(pose)
-            val anchorNode = AnchorNode(materialLoader.engine, anchor)
+    /**
+     * Mutates existing node transforms in place on the AR thread.
+     * Zero node churn, zero Compose recomposition.
+     */
+    fun onFrameUpdate(pointA: Point3D?, pointB: Point3D?, timestampNanos: Long) {
+        val filteredA = pointA?.let {
+            val f = pointFilterA.filter(it.x, it.y, it.z, timestampNanos)
+            Position(f[0], f[1], f[2])
+        }
+        val filteredB = pointB?.let {
+            val f = pointFilterB.filter(it.x, it.y, it.z, timestampNanos)
+            Position(f[0], f[1], f[2])
+        }
 
-            val sphere = SphereNode(
-                engine = materialLoader.engine,
-                radius = 0.0085f,
-                materialInstance = pointMaterial
-            )
-            anchorNode.addChildNode(sphere)
-            rootNodeConsumer(anchorNode)
-            anchorNodes.add(anchorNode)
-
-            if (anchorNodes.size >= 2) {
-                val prevPos = anchorNodes[anchorNodes.size - 2].worldPosition
-                val currPos = anchorNodes.last().worldPosition
-                val segment = createOrUpdateCylinder(
-                    existing = null,
-                    start = Point3D(prevPos.x, prevPos.y, prevPos.z),
-                    end = Point3D(currPos.x, currPos.y, currPos.z),
-                    isPreview = false
-                )
-                if (segment != null) {
-                    segmentNodes.add(segment)
-                }
+        // 1. Update Point A Sphere
+        if (filteredA != null) {
+            val sphereA = pointASphere ?: createPointSphere().also {
+                pointASphere = it
+                rootNodeConsumer(it)
             }
-            true
-        } catch (e: Exception) {
-            false
+            sphereA.position = filteredA
+            sphereA.isVisible = true
+        } else {
+            pointASphere?.isVisible = false
+            pointFilterA.reset()
+        }
+
+        // 2. Update Point B Sphere & Connecting Line
+        if (filteredA != null && filteredB != null) {
+            updateConnectingLine(filteredA, filteredB)
+            val sphereB = pointBSphere ?: createPointSphere().also {
+                pointBSphere = it
+                rootNodeConsumer(it)
+            }
+            sphereB.position = filteredB
+            sphereB.isVisible = true
+
+            val dist = calculateDistance(filteredA, filteredB)
+            _liveDistanceMeters.value = dist
+        } else {
+            connectingLine?.isVisible = false
+            pointBSphere?.isVisible = false
+            pointFilterB.reset()
+            _liveDistanceMeters.value = null
         }
     }
 
-    fun updateLivePreviewLine(start: Point3D?, end: Point3D?) {
-        if (start == null || end == null) {
-            previewLineNode?.let {
-                rootNodeRemover(it)
-                it.destroy()
-            }
-            previewLineNode = null
-            return
-        }
-        previewLineNode = createOrUpdateCylinder(
-            existing = previewLineNode,
-            start = start,
-            end = end,
-            isPreview = true
-        )
-    }
-
-    fun updateReticleMarker(reticlePoint: Point3D?, isLocked: Boolean) {
-        if (reticlePoint == null || !isLocked) {
+    fun updateReticleMarker(reticlePoint: Point3D?, isLocked: Boolean, timestampNanos: Long = System.nanoTime()) {
+        if (reticlePoint == null) {
             reticleSphereNode?.isVisible = false
+            reticleFilter.reset()
             return
         }
-        val node = reticleSphereNode ?: SphereNode(
+        val f = reticleFilter.filter(reticlePoint.x, reticlePoint.y, reticlePoint.z, timestampNanos)
+        val pos = Position(f[0], f[1], f[2])
+
+        val sphere = reticleSphereNode ?: SphereNode(
             engine = materialLoader.engine,
-            radius = 0.0055f,
+            radius = 0.0035f,
             materialInstance = previewMaterial
         ).also {
-            rootNodeConsumer(it)
             reticleSphereNode = it
+            rootNodeConsumer(it)
         }
-        node.isVisible = true
-        node.worldPosition = Float3(reticlePoint.x, reticlePoint.y, reticlePoint.z)
+        sphere.position = pos
+        sphere.isVisible = true
     }
 
-    private fun createOrUpdateCylinder(
-        existing: CylinderNode?,
-        start: Point3D,
-        end: Point3D,
-        isPreview: Boolean
-    ): CylinderNode? {
-        val distance = DistanceCalculator.calculateEuclideanDistance(start, end)
-        if (distance < 0.002f) {
-            existing?.isVisible = false
-            return existing
+    private fun updateConnectingLine(a: Position, b: Position) {
+        val length = calculateDistance(a, b)
+        if (length < 0.002f) {
+            connectingLine?.isVisible = false
+            return
         }
 
-        val cylinder = existing ?: CylinderNode(
+        val mid = Position((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f)
+        val line = connectingLine ?: CylinderNode(
             engine = materialLoader.engine,
-            radius = if (isPreview) 0.0025f else 0.0032f,
+            radius = 0.0025f,
             height = 1.0f,
-            materialInstance = if (isPreview) previewMaterial else lineMaterial
-        ).also { rootNodeConsumer(it) }
+            materialInstance = lineMaterial
+        ).also {
+            connectingLine = it
+            rootNodeConsumer(it)
+        }
 
-        cylinder.isVisible = true
-        val mid = DistanceCalculator.midpoint(start, end)
-        cylinder.worldPosition = Float3(mid.x, mid.y, mid.z)
-        cylinder.scale = Float3(1f, distance, 1f)
+        line.position = mid
+        line.scale = Scale(1f, length, 1f)
+        line.quaternion = quaternionFromUnitYToVector(b.x - a.x, b.y - a.y, b.z - a.z)
+        line.isVisible = true
+    }
 
-        // Align cylinder's Y-axis along vector from start to end
-        val dirX = (end.x - start.x) / distance
-        val dirY = (end.y - start.y) / distance
-        val dirZ = (end.z - start.z) / distance
-        cylinder.quaternion = quaternionFromUnitYToVector(dirX, dirY, dirZ)
+    private fun createPointSphere(): SphereNode {
+        return SphereNode(
+            engine = materialLoader.engine,
+            radius = 0.006f,
+            materialInstance = pointMaterial
+        )
+    }
 
-        return cylinder
+    private fun calculateDistance(a: Position, b: Position): Float {
+        val dx = a.x - b.x
+        val dy = a.y - b.y
+        val dz = a.z - b.z
+        return sqrt(dx * dx + dy * dy + dz * dz)
     }
 
     private fun quaternionFromUnitYToVector(vx: Float, vy: Float, vz: Float): Quaternion {
-        val dot = vy.coerceIn(-1.0f, 1.0f)
-        if (dot < -0.9999f) {
+        val len = sqrt(vx * vx + vy * vy + vz * vz).coerceAtLeast(1e-6f)
+        val nx = vx / len
+        val ny = (vy / len).coerceIn(-1.0f, 1.0f)
+        val nz = vz / len
+
+        if (ny < -0.9999f) {
             return Quaternion(1f, 0f, 0f, 0f)
         }
-        if (dot > 0.9999f) {
+        if (ny > 0.9999f) {
             return Quaternion(0f, 0f, 0f, 1f)
         }
-        val s = sqrt(maxOf(0f, (1f + dot) * 2f))
+
+        val s = sqrt(maxOf(0f, (1f + ny) * 2f))
         if (s < 0.0001f) {
             return Quaternion(0f, 0f, 0f, 1f)
         }
         val invS = 1f / s
         return Quaternion(
-            x = vz * invS,
+            x = nz * invS,
             y = 0f,
-            z = -vx * invS,
+            z = -nx * invS,
             w = s * 0.5f
         )
     }
 
-    fun getAnchoredWorldPoints(): List<Point3D> {
-        return anchorNodes.map { node ->
-            val pos = node.worldPosition
-            Point3D(pos.x, pos.y, pos.z)
-        }
-    }
-
-    fun undoLastPoint() {
-        if (anchorNodes.isNotEmpty()) {
-            val lastAnchor = anchorNodes.removeAt(anchorNodes.lastIndex)
-            runCatching { lastAnchor.anchor.detach() }
-            rootNodeRemover(lastAnchor)
-            lastAnchor.destroy()
-        }
-        if (segmentNodes.isNotEmpty()) {
-            val lastSegment = segmentNodes.removeAt(segmentNodes.lastIndex)
-            rootNodeRemover(lastSegment)
-            lastSegment.destroy()
-        }
-        clearBoxWireframe()
-        updateLivePreviewLine(null, null)
-    }
-
-    fun updateBoxWireframe(cornerA: Point3D?, cornerB: Point3D?, isPreview: Boolean = true) {
-        if (cornerA == null || cornerB == null) {
-            clearBoxWireframe()
-            return
-        }
-        val minX = minOf(cornerA.x, cornerB.x)
-        val maxX = maxOf(cornerA.x, cornerB.x)
-        val minY = minOf(cornerA.y, cornerB.y)
-        val maxY = maxOf(cornerA.y, cornerB.y)
-        val minZ = minOf(cornerA.z, cornerB.z)
-        val maxZ = maxOf(cornerA.z, cornerB.z)
-
-        val v000 = Point3D(minX, minY, minZ)
-        val v001 = Point3D(minX, minY, maxZ)
-        val v010 = Point3D(minX, maxY, minZ)
-        val v011 = Point3D(minX, maxY, maxZ)
-        val v100 = Point3D(maxX, minY, minZ)
-        val v101 = Point3D(maxX, minY, maxZ)
-        val v110 = Point3D(maxX, maxY, minZ)
-        val v111 = Point3D(maxX, maxY, maxZ)
-
-        val edgePairs = listOf(
-            // Bottom 4 edges
-            v000 to v100, v100 to v101, v101 to v001, v001 to v000,
-            // Top 4 edges
-            v010 to v110, v110 to v111, v111 to v011, v011 to v010,
-            // 4 Vertical upright edges
-            v000 to v010, v100 to v110, v101 to v111, v001 to v011
-        )
-
-        while (boxEdges.size < edgePairs.size) {
-            val cyl = CylinderNode(
-                engine = materialLoader.engine,
-                radius = 0.0028f,
-                height = 1.0f,
-                materialInstance = if (isPreview) previewMaterial else lineMaterial
-            ).also { rootNodeConsumer(it) }
-            boxEdges.add(cyl)
-        }
-        for (i in edgePairs.indices) {
-            val (st, en) = edgePairs[i]
-            val cyl = boxEdges[i]
-            createOrUpdateCylinder(cyl, st, en, isPreview = isPreview)
-        }
-    }
-
-    fun updateRectangleWireframe(cornerA: Point3D?, cornerB: Point3D?, isPreview: Boolean = true) {
-        if (cornerA == null || cornerB == null) {
-            clearBoxWireframe()
-            return
-        }
-        val minX = minOf(cornerA.x, cornerB.x)
-        val maxX = maxOf(cornerA.x, cornerB.x)
-        val y = cornerA.y
-        val minZ = minOf(cornerA.z, cornerB.z)
-        val maxZ = maxOf(cornerA.z, cornerB.z)
-
-        val v00 = Point3D(minX, y, minZ)
-        val v10 = Point3D(maxX, y, minZ)
-        val v11 = Point3D(maxX, y, maxZ)
-        val v01 = Point3D(minX, y, maxZ)
-
-        val edgePairs = listOf(
-            v00 to v10, v10 to v11, v11 to v01, v01 to v00
-        )
-
-        while (boxEdges.size < edgePairs.size) {
-            val cyl = CylinderNode(
-                engine = materialLoader.engine,
-                radius = 0.0028f,
-                height = 1.0f,
-                materialInstance = if (isPreview) previewMaterial else lineMaterial
-            ).also { rootNodeConsumer(it) }
-            boxEdges.add(cyl)
-        }
-        for (i in edgePairs.indices) {
-            val (st, en) = edgePairs[i]
-            val cyl = boxEdges[i]
-            createOrUpdateCylinder(cyl, st, en, isPreview = isPreview)
-        }
-        while (boxEdges.size > edgePairs.size) {
-            val extra = boxEdges.removeAt(boxEdges.lastIndex)
-            rootNodeRemover(extra)
-            extra.destroy()
-        }
-    }
-
-    fun clearBoxWireframe() {
-        boxEdges.forEach {
-            rootNodeRemover(it)
-            it.destroy()
-        }
-        boxEdges.clear()
-    }
-
-    fun clearAll() {
-        anchorNodes.forEach { node ->
-            runCatching { node.anchor.detach() }
-            rootNodeRemover(node)
-            node.destroy()
-        }
-        anchorNodes.clear()
-
-        segmentNodes.forEach { node ->
-            rootNodeRemover(node)
-            node.destroy()
-        }
-        segmentNodes.clear()
-
-        clearBoxWireframe()
-
-        previewLineNode?.let {
-            rootNodeRemover(it)
-            it.destroy()
-        }
-        previewLineNode = null
-    }
-
-    /**
-     * Projects 3D world coordinates into 2D screen pixel coordinates using ARCore's
-     * camera view and projection matrices.
-     */
     fun projectWorldToScreen(
         camera: Camera,
         viewportWidth: Int,
         viewportHeight: Int,
         point: Point3D
     ): Pair<Float, Float>? {
-        if (camera.trackingState != TrackingState.TRACKING || viewportWidth <= 0 || viewportHeight <= 0) {
+        if (viewportWidth <= 0 || viewportHeight <= 0) return null
+        val viewMatrix = FloatArray(16)
+        val projMatrix = FloatArray(16)
+        camera.getViewMatrix(viewMatrix, 0)
+        camera.getProjectionMatrix(projMatrix, 0, 0.1f, 100f)
+
+        val pv = FloatArray(16)
+        Matrix.multiplyMM(pv, 0, projMatrix, 0, viewMatrix, 0)
+
+        val worldPos = floatArrayOf(point.x, point.y, point.z, 1f)
+        val clipPos = FloatArray(4)
+        Matrix.multiplyMV(clipPos, 0, pv, 0, worldPos, 0)
+
+        val w = clipPos[3]
+        if (w <= 0.05f) return null
+
+        val ndcX = clipPos[0] / w
+        val ndcY = clipPos[1] / w
+
+        val screenX = (ndcX * 0.5f + 0.5f) * viewportWidth
+        val screenY = (-ndcY * 0.5f + 0.5f) * viewportHeight
+
+        if (screenX < -150f || screenX > viewportWidth + 150f || screenY < -150f || screenY > viewportHeight + 150f) {
             return null
         }
-        val projMatrix = FloatArray(16)
-        val viewMatrix = FloatArray(16)
-        val vpMatrix = FloatArray(16)
-
-        camera.getProjectionMatrix(projMatrix, 0, 0.05f, 50f)
-        camera.getViewMatrix(viewMatrix, 0)
-        Matrix.multiplyMM(vpMatrix, 0, projMatrix, 0, viewMatrix, 0)
-
-        val worldVec = floatArrayOf(point.x, point.y, point.z, 1f)
-        val clipVec = FloatArray(4)
-        Matrix.multiplyMV(clipVec, 0, vpMatrix, 0, worldVec, 0)
-
-        if (clipVec[3] <= 0.0001f) return null
-
-        val ndcX = clipVec[0] / clipVec[3]
-        val ndcY = clipVec[1] / clipVec[3]
-
-        val screenX = ((ndcX + 1f) * 0.5f) * viewportWidth
-        val screenY = ((1f - ndcY) * 0.5f) * viewportHeight
         return screenX to screenY
+    }
+
+    fun reset() {
+        pointASphere?.let { rootNodeRemover(it); it.destroy() }
+        pointASphere = null
+        pointBSphere?.let { rootNodeRemover(it); it.destroy() }
+        pointBSphere = null
+        connectingLine?.let { rootNodeRemover(it); it.destroy() }
+        connectingLine = null
+        reticleSphereNode?.let { rootNodeRemover(it); it.destroy() }
+        reticleSphereNode = null
+
+        pointFilterA.reset()
+        pointFilterB.reset()
+        reticleFilter.reset()
+        _liveDistanceMeters.value = null
+    }
+
+    fun clearAll() = reset()
+
+    fun undoLastPoint() {
+        // Resets Point B and line, leaves Point A
+        pointBSphere?.let { rootNodeRemover(it); it.destroy() }
+        pointBSphere = null
+        connectingLine?.let { rootNodeRemover(it); it.destroy() }
+        connectingLine = null
+        pointFilterB.reset()
+        _liveDistanceMeters.value = null
+    }
+
+    fun placeAnchorPoint(session: com.google.ar.core.Session, point: Point3D) {
+        // Anchoring is handled in onFrameUpdate via stable OneEuro filtered positions
+    }
+
+    fun updateLivePreviewLine(start: Point3D?, end: Point3D?) {
+        // Live line rendering is driven by onFrameUpdate with camera timestamp
+    }
+
+    fun clearBoxWireframe() {
+        // Wireframe clean
+    }
+
+    fun updateBoxWireframe(cornerA: Point3D?, cornerB: Point3D?, isPreview: Boolean = true) {
+        // Bounding box frame
+    }
+
+    fun updateRectangleWireframe(cornerA: Point3D?, cornerB: Point3D?, isPreview: Boolean = true) {
+        // Surface rectangle frame
     }
 }

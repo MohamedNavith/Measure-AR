@@ -213,6 +213,7 @@ fun MeasureCameraScreen(
             rootNodeRemover = { node -> childNodes.remove(node) }
         )
     }
+    val liveFilteredDistance by lineRenderer.liveDistanceMeters.collectAsStateWithLifecycle()
 
     DisposableEffect(lineRenderer) {
         onDispose {
@@ -265,80 +266,42 @@ fun MeasureCameraScreen(
                 val hitUpdate = arMeasureSession.processFrame(
                     session = session,
                     frame = frame,
-                    viewportWidth = viewportSize.width,
-                    viewportHeight = viewportSize.height,
-                    measureMode = uiState.mode,
-                    placedPoints = uiState.placedPoints
+                    viewWidth = viewportSize.width,
+                    viewHeight = viewportSize.height
                 )
 
-                if (hitUpdate.isEdgeSnapped && !wasEdgeSnapped && settings.hapticFeedbackEnabled) {
-                    localView.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                }
-                wasEdgeSnapped = hitUpdate.isEdgeSnapped
+                val hitPoint = hitUpdate.hitPoint
+                val isLocked = hitUpdate.isPlaneLocked
 
                 viewModel.onFrameHitUpdated(
-                    hitPoint = hitUpdate.hitPoint,
-                    isPlaneLocked = hitUpdate.isPlaneLocked,
-                    isEdgeSnapped = hitUpdate.isEdgeSnapped,
+                    hitPoint = hitPoint,
+                    isPlaneLocked = isLocked,
+                    isEdgeSnapped = false,
                     trackingHint = hitUpdate.trackingHint
                 )
 
-                // Update 3D reticle sphere & 3D preview cylinder
+                // 1. Update 3D reticle marker using OneEuroFilter
                 lineRenderer.updateReticleMarker(
-                    reticlePoint = hitUpdate.hitPoint,
-                    isLocked = hitUpdate.isPlaneLocked
+                    reticlePoint = hitPoint,
+                    isLocked = isLocked,
+                    timestampNanos = frame.timestamp
                 )
 
-                // Update procedural 3D wireframe according to mode
-                when (uiState.mode) {
-                    MeasureMode.BOX_3D -> {
-                        lineRenderer.updateLivePreviewLine(null, null)
-                        if (uiState.stepState == MeasureStepState.Live && uiState.placedPoints.isNotEmpty()) {
-                            lineRenderer.updateBoxWireframe(
-                                cornerA = uiState.placedPoints.first(),
-                                cornerB = hitUpdate.hitPoint,
-                                isPreview = true
-                            )
-                        } else if (uiState.stepState == MeasureStepState.Done && uiState.placedPoints.size >= 2) {
-                            lineRenderer.updateBoxWireframe(
-                                cornerA = uiState.placedPoints[0],
-                                cornerB = uiState.placedPoints[1],
-                                isPreview = false
-                            )
-                        } else {
-                            lineRenderer.clearBoxWireframe()
-                        }
-                    }
-                    MeasureMode.RECTANGLE -> {
-                        lineRenderer.updateLivePreviewLine(null, null)
-                        if (uiState.stepState == MeasureStepState.Live && uiState.placedPoints.isNotEmpty()) {
-                            lineRenderer.updateRectangleWireframe(
-                                cornerA = uiState.placedPoints.first(),
-                                cornerB = hitUpdate.hitPoint,
-                                isPreview = true
-                            )
-                        } else if (uiState.stepState == MeasureStepState.Done && uiState.placedPoints.size >= 2) {
-                            lineRenderer.updateRectangleWireframe(
-                                cornerA = uiState.placedPoints[0],
-                                cornerB = uiState.placedPoints[1],
-                                isPreview = false
-                            )
-                        } else {
-                            lineRenderer.clearBoxWireframe()
-                        }
-                    }
-                    else -> {
-                        lineRenderer.clearBoxWireframe()
-                        if (uiState.stepState == MeasureStepState.Live && uiState.placedPoints.isNotEmpty()) {
-                            lineRenderer.updateLivePreviewLine(
-                                start = uiState.placedPoints.last(),
-                                end = hitUpdate.hitPoint
-                            )
-                        } else {
-                            lineRenderer.updateLivePreviewLine(null, null)
-                        }
-                    }
+                // 2. Direct mutation on Filament nodes with OneEuroFilter (Zero Compose Recomposition)
+                val pointA = uiState.placedPoints.firstOrNull()
+                val pointB = if (uiState.stepState == MeasureStepState.Live) {
+                    hitPoint
+                } else if (uiState.stepState == MeasureStepState.Done && uiState.placedPoints.size >= 2) {
+                    uiState.placedPoints[1]
+                } else {
+                    null
                 }
+
+                lineRenderer.onFrameUpdate(
+                    pointA = pointA,
+                    pointB = pointB,
+                    timestampNanos = frame.timestamp
+                )
 
                 // Project 3D segments to 2D screen coordinates for crisp floating badges
                 val camera = frame.camera
@@ -358,13 +321,18 @@ fun MeasureCameraScreen(
                         point = seg.end
                     ) ?: return@mapNotNull null
 
+                    val dist = if (seg.isPreview && liveFilteredDistance != null) {
+                        liveFilteredDistance!!
+                    } else {
+                        seg.distanceMeters
+                    }
                     OverlaySegment2D(
                         startX = pStart.first,
                         startY = pStart.second,
                         endX = pEnd.first,
                         endY = pEnd.second,
-                        distanceMeters = seg.distanceMeters,
-                        label = UnitConverter.formatDistance(seg.distanceMeters, currentUnit),
+                        distanceMeters = dist,
+                        label = UnitConverter.formatDistance(dist, currentUnit),
                         isPreview = seg.isPreview
                     )
                 }
@@ -639,9 +607,14 @@ fun MeasureCameraScreen(
                                     }
                                 }
                                 else -> {
+                                    val displayMeters = if (uiState.stepState == MeasureStepState.Live && liveFilteredDistance != null) {
+                                        liveFilteredDistance!!
+                                    } else {
+                                        uiState.activeDisplayMeters
+                                    }
                                     Text(
                                         text = UnitConverter.formatDistance(
-                                            uiState.activeDisplayMeters,
+                                            displayMeters,
                                             settings.unit
                                         ),
                                         style = TabularMeasureTextStyle.copy(

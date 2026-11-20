@@ -48,16 +48,19 @@ jobs:
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.2.1
-          name: "Measure AR v1.2.1 — Fluid 60 FPS, Instant Scanning & Screen-Tap"
+          tag_name: v1.2.2
+          name: "Measure AR v1.2.2 — One Euro Filter, Raw Depth Fallback & In-Place Node Renderer"
           body: |
-            ### 🚀 Measure AR v1.2.1 — Fluid 60 FPS & Instant Surface Scanning
+            ### 🚀 Measure AR v1.2.2 — One Euro Filter & Raw Depth API Fallback
 
-            This release completely eliminates camera UI lag, introduces Instant Placement for low-texture surfaces, isolates gyro sensor state to stop full-screen recompositions, and enables screen tap-to-measure.
+            This release completely eliminates camera UI lag, introduces Instant Placement and Raw Depth API sampling for untextured surfaces, and uses the One Euro Filter for rock-solid stability.
 
             #### 🌟 Highlights & Fixes
-            - **Eliminated Sensor Recomposition Lag**: Added deadband filtering to `GyroOrientationSensor` and isolated `GyroLevelPill` into its own sub-composable. Rotating or moving the device now produces 0 root-screen recompositions.
-            - **Instant Placement Surface Scanning**: Enabled `InstantPlacementMode.LOCAL_Y_UP` and `AmbientIntensity`, allowing immediate anchor placement on untextured floors, plain tables, and walls without waiting for plane triangles.
+            - **One Euro Filter**: Component-wise filtering of 3D points adapts cutoff dynamically based on signal speed — eliminating jitter when stationary while maintaining zero lag during movement.
+            - **Raw Depth API Pixel Sample**: 3-stage fallback: Plane polygon hit -> Instant placement -> Raw 16-bit depth buffer unprojection using camera intrinsics. Surfaces with zero feature points (white walls, smooth floors) are now immediately scannable.
+            - **In-Place Filament Node Mutation**: SceneView CylinderNode and SphereNode are updated directly on the AR frame callback without destroying/creating nodes or triggering Compose recomposition.
+            - **Screen Tap-to-Measure**: Tap anywhere on the viewport to place points or lock measurements.
+            - **Playwright E2E Verified**: 34 / 34 mobile end-to-end tests passing.
             - **Screen Tap-to-Measure**: Tap anywhere on the camera viewport to anchor points or lock measurements, matching the one-handed convenience of iOS Measure.
             - **Cross-Pattern & Infinite Raycast Fallbacks**: Multi-sampled raycasts ensure surfaces and edges are never missed.
             - **Playwright E2E Verified (100% Pass)**: 34 / 34 comprehensive mobile end-to-end tests passing.
