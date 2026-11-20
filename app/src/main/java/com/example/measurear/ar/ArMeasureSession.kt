@@ -27,6 +27,8 @@ class ArMeasureSession {
 
     private var lastSmoothedPoint: Point3D? = null
     private var lastEdgeSnapped: Boolean = false
+    private var cachedEdgeSegments: List<Pair<Point3D, Point3D>> = emptyList()
+    private var lastEdgeExtractionTimeMs: Long = 0L
 
     fun checkArCoreAvailability(context: Context): Boolean {
         return try {
@@ -39,7 +41,7 @@ class ArMeasureSession {
 
     fun configureSessionFeatures(session: Session, config: Config) {
         config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-        config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
+        config.lightEstimationMode = Config.LightEstimationMode.AMBIENT_INTENSITY
 
         // Enable Instant Placement for instant hit testing without waiting for full planes
         config.instantPlacementMode = Config.InstantPlacementMode.LOCAL_Y_UP
@@ -114,7 +116,27 @@ class ArMeasureSession {
 
         val centerX = viewportWidth * 0.5f
         val centerY = viewportHeight * 0.5f
-        val hitResults = frame.hitTest(centerX, centerY)
+        var hitResults = frame.hitTest(centerX, centerY)
+
+        // If center pixel missed (e.g. edge of a table or untextured patch), sample adjacent cross pattern
+        if (hitResults.isEmpty()) {
+            val offset = 24f
+            val offsets = floatArrayOf(
+                centerX + offset, centerY,
+                centerX - offset, centerY,
+                centerX, centerY + offset,
+                centerX, centerY - offset
+            )
+            var i = 0
+            while (i < offsets.size) {
+                val testHits = frame.hitTest(offsets[i], offsets[i + 1])
+                if (testHits.isNotEmpty()) {
+                    hitResults = testHits
+                    break
+                }
+                i += 2
+            }
+        }
 
         // 1. Plane polygon hit (highest confidence)
         val planeHit = hitResults.firstOrNull { hit ->
@@ -145,7 +167,13 @@ class ArMeasureSession {
 
         val chosenHit = planeHit ?: instantHit ?: generalPlaneHit ?: featureHit
 
+        // 5. Plane Raycast Fallback: If no hit but we have active planes, intersect camera ray with nearest plane
+        var planeRaycastPoint: Point3D? = null
         if (chosenHit == null) {
+            planeRaycastPoint = raycastToNearestTrackedPlane(camera, session)
+        }
+
+        if (chosenHit == null && planeRaycastPoint == null) {
             lastSmoothedPoint = null
             return FrameHitUpdate(
                 hitPoint = null,
@@ -155,12 +183,16 @@ class ArMeasureSession {
             )
         }
 
-        val hitPose = chosenHit.hitPose
-        val rawPoint = Point3D(hitPose.tx(), hitPose.ty(), hitPose.tz())
+        val rawPoint = if (chosenHit != null) {
+            val hitPose = chosenHit.hitPose
+            Point3D(hitPose.tx(), hitPose.ty(), hitPose.tz())
+        } else {
+            planeRaycastPoint!!
+        }
 
         // Extract plane extent for auto surface dimension detection
         var surfaceExtent: Pair<Float, Float>? = null
-        val targetPlane = (chosenHit.trackable as? Plane)
+        val targetPlane = (chosenHit?.trackable as? Plane)
         if (targetPlane != null && targetPlane.trackingState == TrackingState.TRACKING) {
             surfaceExtent = targetPlane.extentX to targetPlane.extentZ
         }
@@ -215,6 +247,12 @@ class ArMeasureSession {
     }
 
     private fun extractPlaneEdgeSegments(session: Session): List<Pair<Point3D, Point3D>> {
+        val now = System.currentTimeMillis()
+        if (now - lastEdgeExtractionTimeMs < 300L && cachedEdgeSegments.isNotEmpty()) {
+            return cachedEdgeSegments
+        }
+        lastEdgeExtractionTimeMs = now
+
         val segments = mutableListOf<Pair<Point3D, Point3D>>()
         val planes = session.getAllTrackables(Plane::class.java)
         for (plane in planes) {
@@ -235,7 +273,42 @@ class ArMeasureSession {
                 }
             }
         }
+        cachedEdgeSegments = segments
         return segments
+    }
+
+    private fun raycastToNearestTrackedPlane(camera: Camera, session: Session): Point3D? {
+        val camPose = camera.displayOrientedPose
+        val camPos = Point3D(camPose.tx(), camPose.ty(), camPose.tz())
+        val zAxis = camPose.zAxis
+        val rayDir = Point3D(-zAxis[0], -zAxis[1], -zAxis[2])
+
+        val planes = session.getAllTrackables(Plane::class.java)
+        var closestPoint: Point3D? = null
+        var closestDist = Float.MAX_VALUE
+
+        for (plane in planes) {
+            if (plane.trackingState != TrackingState.TRACKING || plane.subsumedBy != null) continue
+            val planePose = plane.centerPose
+            val planeY = planePose.ty()
+
+            if (plane.type == Plane.Type.HORIZONTAL_UPWARD_FACING || plane.type == Plane.Type.HORIZONTAL_DOWNWARD_FACING) {
+                if (abs(rayDir.y) < 0.04f) continue
+                val t = (planeY - camPos.y) / rayDir.y
+                if (t in 0.2f..6.0f && t < closestDist) {
+                    val hitX = camPos.x + rayDir.x * t
+                    val hitZ = camPos.z + rayDir.z * t
+                    val dx = hitX - planePose.tx()
+                    val dz = hitZ - planePose.tz()
+                    val maxExtent = maxOf(plane.extentX, plane.extentZ, 1.5f) * 1.5f
+                    if (sqrt(dx * dx + dz * dz) <= maxExtent) {
+                        closestDist = t
+                        closestPoint = Point3D(hitX, planeY, hitZ)
+                    }
+                }
+            }
+        }
+        return closestPoint
     }
 
     private fun computeVerticalHeightTarget(camera: Camera, floorPoint: Point3D): Point3D? {

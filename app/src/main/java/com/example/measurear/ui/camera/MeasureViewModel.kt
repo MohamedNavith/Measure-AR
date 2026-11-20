@@ -97,24 +97,24 @@ data class MeasureUiState(
             return when (stepState) {
                 MeasureStepState.Searching -> "Move phone slowly to detect surfaces"
                 MeasureStepState.ReadyToPlaceA -> when (mode) {
-                    MeasureMode.STANDARD -> "Tap + to place start point"
-                    MeasureMode.MULTI_POINT -> "Tap + to start perimeter chain"
-                    MeasureMode.HEIGHT -> "Aim at floor and tap + to set base"
-                    MeasureMode.BOX_3D -> "Tap + at 1st box corner"
-                    MeasureMode.RECTANGLE -> "Tap + at 1st surface corner"
+                    MeasureMode.STANDARD -> "Tap screen or + to place start point"
+                    MeasureMode.MULTI_POINT -> "Tap screen or + to start perimeter chain"
+                    MeasureMode.HEIGHT -> "Aim at floor and tap to set base"
+                    MeasureMode.BOX_3D -> "Tap screen or + at 1st box corner"
+                    MeasureMode.RECTANGLE -> "Tap screen or + at 1st surface corner"
                 }
-                MeasureStepState.PlacedA -> "Move slightly to start measuring"
+                MeasureStepState.PlacedA -> "Move phone to extend measurement"
                 MeasureStepState.Live -> when (mode) {
-                    MeasureMode.STANDARD -> "Move to target and tap + to finish"
-                    MeasureMode.MULTI_POINT -> "Tap + to add point, or checkmark to finish"
-                    MeasureMode.HEIGHT -> "Tilt phone up to top edge and tap +"
-                    MeasureMode.BOX_3D -> "Move to opposite diagonal corner and tap +"
-                    MeasureMode.RECTANGLE -> "Move diagonally across surface and tap +"
+                    MeasureMode.STANDARD -> "Move to target and tap to lock"
+                    MeasureMode.MULTI_POINT -> "Tap to add point, or ✓ to finish"
+                    MeasureMode.HEIGHT -> "Tilt phone up to top edge and tap"
+                    MeasureMode.BOX_3D -> "Move to opposite diagonal corner and tap"
+                    MeasureMode.RECTANGLE -> "Move diagonally across surface and tap"
                 }
                 MeasureStepState.Done -> when (mode) {
-                    MeasureMode.BOX_3D -> "3D Box dimensions locked"
-                    MeasureMode.RECTANGLE -> "Surface dimensions locked"
-                    else -> "Measurement locked"
+                    MeasureMode.BOX_3D -> "3D Box dimensions locked • Tap + for new"
+                    MeasureMode.RECTANGLE -> "Surface dimensions locked • Tap + for new"
+                    else -> "Measurement locked • Tap + for new"
                 }
             }
         }

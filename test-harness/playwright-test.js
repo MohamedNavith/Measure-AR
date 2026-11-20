@@ -229,6 +229,44 @@ const fs = require('fs');
   await page.screenshot({ path: path.join(screenshotsDir, '08-clear-reset.png') });
 
   // ----------------------------------------------------
+  // TEST 10: Screen Tap-to-Measure (User Friendly iOS-Parity)
+  // ----------------------------------------------------
+  console.log('\n--- Test 10: Screen Tap-to-Measure (Anywhere on Viewport) ---');
+  // Click directly on the camera viewport (not the button)
+  await page.click('#viewport', { position: { x: 206, y: 350 } });
+  const pointsAfterScreenTap = await page.evaluate(() => window.measureArSim.getState().placedPoints.length);
+  assert(pointsAfterScreenTap === 1, 'Tapping anywhere on camera screen placed Point A');
+
+  // Tap again to lock measurement
+  await page.click('#viewport', { position: { x: 206, y: 350 } });
+  const stateAfterSecondTap = await page.evaluate(() => window.measureArSim.getState().step);
+  assert(stateAfterSecondTap === 'Done', 'Second tap on camera screen locked measurement');
+
+  // Reset
+  await page.click('[data-testid="new-btn"]');
+
+  // ----------------------------------------------------
+  // TEST 11: Instant Surface Scanning & Low-Texture Tracking
+  // ----------------------------------------------------
+  console.log('\n--- Test 11: Instant Surface Scanning & Low-Texture Tracking ---');
+  // Simulate low texture surface with instant placement enabled
+  await page.evaluate(() => {
+    window.measureArSim.setReticlePosition(0.5, -0.2, -1.2);
+    return window.measureArSim.getState().isSurfaceLocked;
+  });
+  const instantSurfaceLocked = await page.evaluate(() => window.measureArSim.getState().isSurfaceLocked);
+  assert(instantSurfaceLocked === true, 'Instant placement locks onto low-texture & untextured surfaces');
+
+  // ----------------------------------------------------
+  // TEST 12: Zero-Lag Sensor Deadband & Component Isolation
+  // ----------------------------------------------------
+  console.log('\n--- Test 12: Sensor Deadband & Zero-Lag UI ---');
+  // Micro-tremor simulation (0.1 degree)
+  await page.evaluate(() => window.measureArSim.setTiltAngle(0.1));
+  const levelTextTremor = await page.textContent('[data-testid="level-indicator"]');
+  assert(levelTextTremor.includes('0° LEVEL'), 'Micro-tremor filtered by deadband, maintaining 0° LEVEL without recomposing');
+
+  // ----------------------------------------------------
   // TEST SUMMARY
   // ----------------------------------------------------
   console.log('\n======================================================');

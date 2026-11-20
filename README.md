@@ -18,9 +18,10 @@ Download the signed, installable APK directly to your phone:
 
 | Package | Download Link | Signature | Size | Recommended For |
 |:---|:---|:---|:---|:---|
-| **Release APK (v1.2.0 - Recommended)** | [⬇️ **Download `app-release.apk`**](https://github.com/MohamedNavith/Measure-AR/releases/download/v1.2.0/app-release.apk) | Verified v2 + v3 Schemes | ~41 MB | **Daily Use & Performance** (Cleanest installation) |
-| **Debug APK (v1.2.0)** | [⬇️ **Download `app-debug.apk`**](https://github.com/MohamedNavith/Measure-AR/releases/download/v1.2.0/app-debug.apk) | Signed Development Build | ~49 MB | **Developers & Testing** |
-| **GitHub Releases** | [🏷️ **Release v1.2.0 Assets**](https://github.com/MohamedNavith/Measure-AR/releases/tag/v1.2.0) | Standalone Release Page | — | All Release Versions |
+| **Release APK (v1.2.1 - Recommended)** | [⬇️ **Download `app-release.apk`**](https://github.com/MohamedNavith/Measure-AR/releases/download/v1.2.1/app-release.apk) | Verified v2 + v3 Schemes | ~41 MB | **Daily Use & Performance** (Cleanest installation) |
+| **Debug APK (v1.2.1)** | [⬇️ **Download `app-debug.apk`**](https://github.com/MohamedNavith/Measure-AR/releases/download/v1.2.1/app-debug.apk) | Signed Development Build | ~49 MB | **Developers & Testing** |
+| **GitHub Releases** | [🏷️ **Release v1.2.1 Assets**](https://github.com/MohamedNavith/Measure-AR/releases/tag/v1.2.1) | Standalone Release Page | — | All Release Versions |
+| **Antigravity Technical Report** | [📖 **`antigravity.md`**](antigravity.md) | Technical Optimization Ledger | — | Performance & Architecture Details |
 
 ---
 
@@ -56,7 +57,7 @@ We engineered Measure AR with a strict zero-trust security baseline so it instal
 ## 📱 How to Install
 
 ### Option 1: Direct Install on Android Phone
-1. Tap [Download `app-release.apk`](https://github.com/MohamedNavith/Measure-AR/releases/download/v1.2.0/app-release.apk) from your phone's browser.
+1. Tap [Download `app-release.apk`](https://github.com/MohamedNavith/Measure-AR/releases/download/v1.2.1/app-release.apk) from your phone's browser.
 2. Open the downloaded file from your Downloads folder or notification shade.
 3. If prompted by Android:
    - Select **"Settings"** -> Enable **"Allow from this source"** for your browser/file manager.

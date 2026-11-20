@@ -95,10 +95,23 @@ class GyroOrientationSensor(context: Context) : SensorEventListener {
         val isVertical = abs(inclinationDeg - 90f) <= 1.5f
         val isLevel = isHorizontal || isVertical || (abs(rollDeg) <= 1.0f && abs(pitchDeg) <= 1.0f)
 
+        val newPitch = pitchDeg.roundToInt()
+        val newRoll = rollDeg.roundToInt()
+        val newInclination = inclinationDeg.roundToInt()
+
+        val current = _levelState.value
+        if (current.pitchDegrees == newPitch &&
+            current.rollDegrees == newRoll &&
+            current.inclinationDegrees == newInclination &&
+            current.isLevel == isLevel
+        ) {
+            return
+        }
+
         _levelState.value = DeviceLevelData(
-            pitchDegrees = pitchDeg.roundToInt(),
-            rollDegrees = rollDeg.roundToInt(),
-            inclinationDegrees = inclinationDeg.roundToInt(),
+            pitchDegrees = newPitch,
+            rollDegrees = newRoll,
+            inclinationDegrees = newInclination,
             isLevel = isLevel,
             isVertical = isVertical,
             isHorizontal = isHorizontal

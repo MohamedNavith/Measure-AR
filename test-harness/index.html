@@ -619,13 +619,13 @@
     const statusPill = document.getElementById('status-pill');
     switch (state.step) {
       case 'ReadyToPlaceA':
-        statusPill.textContent = 'Tap + to place start point';
+        statusPill.textContent = 'Tap screen or + to place start point';
         break;
       case 'Live':
-        statusPill.textContent = 'Move to target and tap + to lock';
+        statusPill.textContent = 'Move to target and tap to lock';
         break;
       case 'Done':
-        statusPill.textContent = 'Measurement locked';
+        statusPill.textContent = 'Measurement locked • Tap + for new';
         break;
     }
 
@@ -677,9 +677,13 @@
     document.getElementById('unit-text').textContent = state.unit;
   }
 
-  // Shutter Tap Event
-  document.getElementById('shutter-btn').addEventListener('click', () => {
+  // Shutter & Screen Tap Events (Tap anywhere on screen or + shutter to measure)
+  function handlePlacePoint() {
     if (!state.isSurfaceLocked) return;
+
+    if (state.step === 'Done') {
+      state.placedPoints = [];
+    }
 
     state.placedPoints.push({ ...state.reticle });
 
@@ -692,6 +696,17 @@
       state.step = 'Done';
     }
     updateUI();
+  }
+
+  document.getElementById('shutter-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    handlePlacePoint();
+  });
+
+  document.getElementById('viewport').addEventListener('click', (e) => {
+    if (e.target.id === 'viewport' || e.target.id === 'ar-canvas' || e.target.id === 'torch-overlay') {
+      handlePlacePoint();
+    }
   });
 
   // Undo Button

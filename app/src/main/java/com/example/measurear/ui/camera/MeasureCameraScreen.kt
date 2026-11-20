@@ -13,6 +13,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -196,7 +198,6 @@ fun MeasureCameraScreen(
     var wasEdgeSnapped by remember { mutableStateOf(false) }
 
     val gyroSensor = remember { GyroOrientationSensor(context) }
-    val levelData by gyroSensor.levelState.collectAsStateWithLifecycle()
 
     DisposableEffect(gyroSensor) {
         gyroSensor.startListening()
@@ -219,11 +220,30 @@ fun MeasureCameraScreen(
         }
     }
 
+    val onTriggerAddPoint: () -> Unit = {
+        val pointToAnchor = viewModel.onAddPointClicked()
+        if (pointToAnchor != null) {
+            if (settings.hapticFeedbackEnabled) {
+                localView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            }
+            activeSession?.let { session ->
+                lineRenderer.placeAnchorPoint(session, pointToAnchor)
+            }
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
             .onSizeChanged { viewportSize = it }
+            .pointerInput(uiState.reticlePoint) {
+                detectTapGestures {
+                    if (uiState.reticlePoint != null) {
+                        onTriggerAddPoint()
+                    }
+                }
+            }
     ) {
         // 1. Full-Screen ARSceneView (Hardware-accelerated Filament 3D rendering)
         ARScene(
@@ -235,14 +255,7 @@ fun MeasureCameraScreen(
             planeRenderer = settings.showSurfaceGrid, // SceneView's hardware plane renderer
             sessionConfiguration = { session, config ->
                 activeSession = session
-                config.planeFindingMode = Config.PlaneFindingMode.HORIZONTAL_AND_VERTICAL
-                config.lightEstimationMode = Config.LightEstimationMode.ENVIRONMENTAL_HDR
-                config.depthMode = if (session.isDepthModeSupported(Config.DepthMode.AUTOMATIC)) {
-                    Config.DepthMode.AUTOMATIC
-                } else {
-                    Config.DepthMode.DISABLED
-                }
-                config.focusMode = Config.FocusMode.AUTO
+                arMeasureSession.configureSessionFeatures(session, config)
             },
             onViewCreated = {
                 arSceneViewRef = this
@@ -433,28 +446,8 @@ fun MeasureCameraScreen(
                     }
                 }
 
-                // Gyro Level Indicator Pill (iOS Measure Level)
-                val isLevel = levelData.isLevel
-                GlassmorphicCard(
-                    cornerRadius = 50.dp,
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(if (isLevel) ArGreen else Color.White.copy(alpha = 0.5f))
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (isLevel) "0° LEVEL" else "${levelData.inclinationDegrees}°",
-                            color = if (isLevel) ArGreen else Color.White.copy(alpha = 0.85f),
-                            fontWeight = FontWeight.Bold,
-                            fontSize = 12.sp
-                        )
-                    }
-                }
+                // Gyro Level Indicator Pill (iOS Measure Level) - Isolated to prevent root recomposition
+                GyroLevelPill(gyroSensor = gyroSensor)
 
                 // Action Buttons: Flashlight, Focus Lock, History, Settings
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -719,20 +712,10 @@ fun MeasureCameraScreen(
                         Icon(Icons.AutoMirrored.Rounded.Undo, contentDescription = null)
                     }
 
-                    // Center "+" Shutter Button
+                    // Center "+" Shutter Button (also triggered by screen tap)
                     ShutterAddPointButton(
                         enabled = uiState.reticlePoint != null,
-                        onClick = {
-                            val pointToAnchor = viewModel.onAddPointClicked()
-                            if (pointToAnchor != null) {
-                                if (settings.hapticFeedbackEnabled) {
-                                    localView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-                                }
-                                activeSession?.let { session ->
-                                    lineRenderer.placeAnchorPoint(session, pointToAnchor)
-                                }
-                            }
-                        }
+                        onClick = onTriggerAddPoint
                     )
 
                     // Right Action: Finish Chain (in Multi-Point mode with 2+ points) or Clear All
@@ -1151,6 +1134,32 @@ private fun ArUnsupportedFallback() {
                     textAlign = TextAlign.Center
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun GyroLevelPill(gyroSensor: GyroOrientationSensor) {
+    val levelData by gyroSensor.levelState.collectAsStateWithLifecycle()
+    val isLevel = levelData.isLevel
+    GlassmorphicCard(
+        cornerRadius = 50.dp,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(if (isLevel) ArGreen else Color.White.copy(alpha = 0.5f))
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = if (isLevel) "0° LEVEL" else "${levelData.inclinationDegrees}°",
+                color = if (isLevel) ArGreen else Color.White.copy(alpha = 0.85f),
+                fontWeight = FontWeight.Bold,
+                fontSize = 12.sp
+            )
         }
     }
 }
